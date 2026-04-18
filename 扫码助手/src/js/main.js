@@ -243,7 +243,9 @@ function saoma() {
     const t = time();
     let num = 0;//app不在前台的次数
     let retVal = -1;
-    while (time() - t < 1000 * 100) {
+    let lastImageClickTime = 0; // 记录点击相册图片的时间戳
+    let retryCount = 0; // 授权弹窗未弹出的重试计数
+    while (time() - t < 1000 * 130) {
         if ( config.step!==4) return -999
         keepScreen();
         try {
@@ -292,6 +294,7 @@ function saoma() {
                     if (jc.FindNode(descMatch('图片\\d+, ' + maxImg))) {
                         logd('点击: ' + j_node.desc);
                         j_node.click();
+                        lastImageClickTime = time(); // 记录点击图片时间，用于检测授权弹窗超时
                         sleep(5000)
                     }
                 }
@@ -349,6 +352,26 @@ function saoma() {
             }
         } catch (e) {
             loge('demo: ' + e);
+        }
+        // 点击图片后10秒未出现授权弹窗，返回桌面重新打开微信重试
+        if (lastImageClickTime > 0 && time() - lastImageClickTime > 10000) {
+            if (!jc.FindNode(text('请授权获取手机号进行验证 ')) &&
+                !jc.FindNode(text('申请获取并验证你的手机号'))) {
+                retryCount++;
+                logw('点击图片后10秒未检测到授权弹窗，第' + retryCount + '次重试');
+                if (retryCount >= 2) {
+                    loge('重试2次仍未弹出授权窗口');
+                    retVal = 0;
+                    break;
+                }
+                home();
+                sleep(1000);
+                utils.openApp(config.pkgName);
+                sleep(3000);
+                lastImageClickTime = 0;
+            } else {
+                lastImageClickTime = 0;
+            }
         }
         image.recycleAllImage()
         sleep(800);
@@ -418,33 +441,32 @@ function main() {
     let scanResult = -999;
     let resultUploaded = false; // 防止后台线程和主线程双重提交结果
     let scanTaskSnapshot = null; // 检测到结果时立即保存任务快照，防止竞态条件
+    let activeTaskSnapshot = null; // 步骤4开始时保存的任务快照，确保后台线程只上报当前正在扫码的任务
     thread.execAsync(function () {
         while (true) {
             releaseNode();
             removeNodeFlag(0);
             lockNode();
-            if (findNode(text('验证成功').clz('android.widget.TextView').pkg(config.pkgName))) {
-                logd('验证成功');
-                scanResult = 1;
-                // 检测到结果时立即绑定当前任务，避免后续taskConfig被新任务覆盖
-                if (!scanTaskSnapshot && config.step === 4) {
-                    scanTaskSnapshot = {taskId: taskConfig.taskId, wxName: taskConfig.wxName};
+            // 只有在步骤4且有活跃任务快照时才处理结果节点
+            if (config.step === 4 && activeTaskSnapshot && !scanTaskSnapshot) {
+                if (findNode(text('验证成功').clz('android.widget.TextView').pkg(config.pkgName))) {
+                    logd('验证成功');
+                    scanResult = 1;
+                    // 使用步骤4开始时保存的快照，而不是当前的taskConfig
+                    scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
+                } else if (findNode(text('解锁成功').clz('android.widget.TextView').pkg(config.pkgName))) {
+                    logd('解锁成功');
+                    scanResult = 1;
+                    scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
+                } else if (findNode(text('验证失败').clz('android.widget.TextView').pkg(config.pkgName))) {
+                    logd('验证失败');
+                    scanResult = 0;
+                    scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
                 }
-            } else if (findNode(text('解锁成功').clz('android.widget.TextView').pkg(config.pkgName))) {
-                logd('解锁成功');
-                scanResult = 1;
-                if (!scanTaskSnapshot && config.step === 4) {
-                    scanTaskSnapshot = {taskId: taskConfig.taskId, wxName: taskConfig.wxName};
-                }
-            } else if (findNode(text('验证失败').clz('android.widget.TextView').pkg(config.pkgName))) {
-                logd('验证失败');
-                scanResult = 0;
-                if (!scanTaskSnapshot && config.step === 4) {
-                    scanTaskSnapshot = {taskId: taskConfig.taskId, wxName: taskConfig.wxName};
-                }
-            } else if (scanResult !== -999 && !resultUploaded && scanTaskSnapshot) {
+            }
+            // 上报结果
+            if (scanResult !== -999 && !resultUploaded && scanTaskSnapshot) {
                 resultUploaded = true;
-                // 使用快照上报，确保上报的是检测到结果时的任务而非当前任务
                 if (scanResult === 1) {
                     upResult(scanTaskSnapshot);
                 } else if (scanResult === 0) {
@@ -454,6 +476,7 @@ function main() {
                 }
                 scanResult = -999;
                 scanTaskSnapshot = null;
+                activeTaskSnapshot = null; // 清除活跃任务快照
                 config.step = 1
             }
             sleep(200);
@@ -510,19 +533,22 @@ function main() {
                 }
                 break;  //检查当前微信号是否是任务需要的微信号
             case 4:
+                // 步骤4开始时保存当前任务快照，供后台线程使用
+                activeTaskSnapshot = {taskId: taskConfig.taskId, wxName: taskConfig.wxName};
                 scanResult = saoma();
                 // 后台线程没有提交过才由主线程提交
                 if (!resultUploaded) {
                     resultUploaded = true;
                     if (scanResult === 1) {
-                        upResult(taskConfig);
+                        upResult(activeTaskSnapshot);
                     } else if (scanResult === 0) {
-                        upResult(taskConfig, false, '验证失败,需要人工介入');
+                        upResult(activeTaskSnapshot, false, '验证失败,需要人工介入');
                     } else if (scanResult === -1) {
-                        upResult(taskConfig, false, '验证超时');
+                        upResult(activeTaskSnapshot, false, '验证超时');
                     }
                 }
-                scanResult = -999;//复位一下
+                scanResult = -999; // 复位
+                activeTaskSnapshot = null; // 清除活跃任务快照
                 sleep(1000)
                 home();
                 sleep(1000);
