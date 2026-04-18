@@ -417,6 +417,7 @@ function main() {
     let taskConfig = {};
     let scanResult = -999;
     let resultUploaded = false; // 防止后台线程和主线程双重提交结果
+    let scanTaskSnapshot = null; // 检测到结果时立即保存任务快照，防止竞态条件
     thread.execAsync(function () {
         while (true) {
             releaseNode();
@@ -425,22 +426,34 @@ function main() {
             if (findNode(text('验证成功').clz('android.widget.TextView').pkg(config.pkgName))) {
                 logd('验证成功');
                 scanResult = 1;
+                // 检测到结果时立即绑定当前任务，避免后续taskConfig被新任务覆盖
+                if (!scanTaskSnapshot && config.step === 4) {
+                    scanTaskSnapshot = {taskId: taskConfig.taskId, wxName: taskConfig.wxName};
+                }
             } else if (findNode(text('解锁成功').clz('android.widget.TextView').pkg(config.pkgName))) {
                 logd('解锁成功');
                 scanResult = 1;
+                if (!scanTaskSnapshot && config.step === 4) {
+                    scanTaskSnapshot = {taskId: taskConfig.taskId, wxName: taskConfig.wxName};
+                }
             } else if (findNode(text('验证失败').clz('android.widget.TextView').pkg(config.pkgName))) {
                 logd('验证失败');
                 scanResult = 0;
-            } else if (scanResult !== -999 && !resultUploaded) {
+                if (!scanTaskSnapshot && config.step === 4) {
+                    scanTaskSnapshot = {taskId: taskConfig.taskId, wxName: taskConfig.wxName};
+                }
+            } else if (scanResult !== -999 && !resultUploaded && scanTaskSnapshot) {
                 resultUploaded = true;
+                // 使用快照上报，确保上报的是检测到结果时的任务而非当前任务
                 if (scanResult === 1) {
-                    upResult(taskConfig);
+                    upResult(scanTaskSnapshot);
                 } else if (scanResult === 0) {
-                    upResult(taskConfig, false, '验证失败,需要人工介入');
+                    upResult(scanTaskSnapshot, false, '验证失败,需要人工介入');
                 } else if (scanResult === -1) {
-                    upResult(taskConfig, false, '验证超时');
+                    upResult(scanTaskSnapshot, false, '验证超时');
                 }
                 scanResult = -999;
+                scanTaskSnapshot = null;
                 config.step = 1
             }
             sleep(200);
@@ -473,6 +486,7 @@ function main() {
                  * @type {{base64Str: any, taskId: any, wxName: any}}
                  */
                 resultUploaded = false; // 新任务前重置提交标记
+                scanTaskSnapshot = null; // 清除旧任务快照，防止残留的旧结果被误报
                 taskConfig = getScan(config.deviceId);
                 config.step = 2;
                 break;  //获取任务
