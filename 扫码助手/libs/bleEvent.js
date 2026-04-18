@@ -20,6 +20,36 @@ BleEventWrapper.prototype.startConnect = function (bleDeviceName, save, timeout)
 };
 
 /**
+ * 设置WIFI
+ * 适配版本 EC 安卓 11.39.0+
+ * 设置完成后需要重启开发板才能联网
+ * @param name WiFi 名称
+ * @param pwd Wifi 密码
+ * @returns {string|null} null或者空代表正常  其他代表错误信息
+ */
+BleEventWrapper.prototype.setWifi = function (name, pwd) {
+    let result = bleEventWrapper.setWifi(name, pwd)
+    if (result == null || result == undefined || result == "") {
+        return null;
+    }
+    return result + "";
+};
+
+
+/**
+ * 重启开发板
+ * 适配版本 EC 安卓 11.39.0+
+ * @returns {string|null} null或者空代表正常  其他代表错误信息
+ */
+BleEventWrapper.prototype.reset = function () {
+    let result = bleEventWrapper.reset()
+    if (result == null || result == undefined || result == "") {
+        return null;
+    }
+    return result + "";
+};
+
+/**
  * 断开连接
  * 适配版本 EC 安卓 11.37.0+
  * @returns {string|null} null或者空代表正常  其他代表错误信息
@@ -217,6 +247,34 @@ BleEventWrapper.prototype.multiTouch = function (touch1, timeout) {
     return bleEventWrapper.multiTouch(data, timeout);
 };
 
+/**
+ * 隐藏蓝牙的名称
+ * 防止被搜索到
+ * 适配版本 EC 安卓 11.38.0+
+ * @returns {string|null} null或者空代表正常  其他代表错误信息
+ */
+BleEventWrapper.prototype.hideBleName = function () {
+    let result = bleEventWrapper.hideBleName()
+    if (result == null || result == undefined || result == "") {
+        return null;
+    }
+    return result + "";
+};
+
+
+/**
+ * 显示蓝牙的名称
+ * 如果蓝牙通信不成功，可能导致不能显示，那就手动重启一下开发板
+ * 适配版本 EC 安卓 11.38.0+
+ * @returns {string|null} null或者空代表正常  其他代表错误信息
+ */
+BleEventWrapper.prototype.showBleName = function () {
+    let result = bleEventWrapper.showBleName()
+    if (result == null || result == undefined || result == "") {
+        return null;
+    }
+    return result + "";
+};
 
 
 
@@ -302,6 +360,19 @@ BleEventWrapper.prototype.keyPress = function (prefix,code) {
  */
 BleEventWrapper.prototype.keyPressChar = function (prefix,c) {
     let result = bleEventWrapper.keyPressChar(prefix,c)
+    if (result == null || result == undefined || result == "") {
+        return null;
+    }
+    return result + "";
+};
+
+/**
+ * 获取app配置的蓝牙名称
+ * 适配版本 EC 安卓 11.38.0+
+ * @returns {string|null} 名称字符串
+ */
+BleEventWrapper.prototype.getConfigBleName = function () {
+    let result = bleEventWrapper.getConfigBleName()
     if (result == null || result == undefined || result == "") {
         return null;
     }
