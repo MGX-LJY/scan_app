@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":1.29,
+"version":1.30,
 "dialog":true,
-"msg": "修复上报bug",
+"msg": "新增重试机制，延长报错时间",
 "force": true,
-"md5":"00f2a5fc9e64dbdd5b9796891400e4c9",
+"md5":"4a0a338ccd7e2cfc9e1952d7f75bd0b7",
 "download_timeout":300
 }
