@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":1.25,
+"version":1.28,
 "dialog":true,
-"msg": "更新了第二种验证成功方法",
+"msg": "修复了一些bug",
 "force": true,
-"md5":"7f983fe614682539723f3d543369b6f7",
+"md5":"bcdb1fdaada8ab6d013cc387b74c077b",
 "download_timeout":300
 }

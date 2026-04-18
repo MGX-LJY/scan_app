@@ -416,6 +416,7 @@ function main() {
 
     let taskConfig = {};
     let scanResult = -999;
+    let resultUploaded = false; // 防止后台线程和主线程双重提交结果
     thread.execAsync(function () {
         while (true) {
             releaseNode();
@@ -430,7 +431,8 @@ function main() {
             } else if (findNode(text('验证失败').clz('android.widget.TextView').pkg(config.pkgName))) {
                 logd('验证失败');
                 scanResult = 0;
-            } else if (scanResult !== -999) {
+            } else if (scanResult !== -999 && !resultUploaded) {
+                resultUploaded = true;
                 if (scanResult === 1) {
                     upResult(taskConfig);
                 } else if (scanResult === 0) {
@@ -470,6 +472,7 @@ function main() {
                  * 获取任务
                  * @type {{base64Str: any, taskId: any, wxName: any}}
                  */
+                resultUploaded = false; // 新任务前重置提交标记
                 taskConfig = getScan(config.deviceId);
                 config.step = 2;
                 break;  //获取任务
@@ -494,12 +497,16 @@ function main() {
                 break;  //检查当前微信号是否是任务需要的微信号
             case 4:
                 scanResult = saoma();
-                if (scanResult === 1) {
-                    upResult(taskConfig);
-                } else if (scanResult === 0) {
-                    upResult(taskConfig, false, '验证失败,需要人工介入');
-                } else if (scanResult === -1) {
-                    upResult(taskConfig, false, '验证超时');
+                // 后台线程没有提交过才由主线程提交
+                if (!resultUploaded) {
+                    resultUploaded = true;
+                    if (scanResult === 1) {
+                        upResult(taskConfig);
+                    } else if (scanResult === 0) {
+                        upResult(taskConfig, false, '验证失败,需要人工介入');
+                    } else if (scanResult === -1) {
+                        upResult(taskConfig, false, '验证超时');
+                    }
                 }
                 scanResult = -999;//复位一下
                 sleep(1000)
