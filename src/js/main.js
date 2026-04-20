@@ -12,7 +12,8 @@ let config = {
     deviceId: '',
     serverIp: '',
     wxArr: [],
-    step:0
+    step:0,
+    version: '1.31' // 版本号
 };
 
 // const sto = storages.create('arr');
@@ -22,18 +23,6 @@ function showErrMsg(msg) {
     loge(msg);
     laoleng.Alert.dialog('', msg);
     exit();
-}
-
-function demo() {
-    const t = time();
-    while (time() - t < 1000 * 60) {
-        try {
-
-        } catch (e) {
-            loge('demo: ' + e);
-        }
-        sleep(200);
-    }
 }
 
 function initConfig() {
@@ -51,8 +40,9 @@ function initConfig() {
 }
 
 
-function base64ToBitmap(base64Str) {
+function base64ToBitmap(base64Str, taskId) {
     logw('base64转图片');
+    upStepLog(taskId, 'base64', '开始图片转换'); // 步骤日志L02
     const path = '/sdcard/DCIM/newImg.png';
     if (file.exists(path)) file.deleteAllFile(path);
     for (let i = 0; i < 10; i++) {
@@ -68,14 +58,18 @@ function base64ToBitmap(base64Str) {
                     let saveBitmap = image.saveBitmap(bitmap, 'png', 100, path);
                     if (saveBitmap) {
                         utils.insertImageToAlbum(path);
+                        upStepLog(taskId, 'base64', '图片保存到相册成功'); // 步骤日志L03
                         return true;
                     } else {
+                        upStepLog(taskId, 'base64', '图片保存失败', 'warn'); // 步骤日志L04
                         toast('图片保存异常');
                     }
                 } else {
+                    upStepLog(taskId, 'base64', '二维码未解析到内容，第'+(i+1)+'次', 'warn');
                     toast('二维码未解析到内容');
                 }
             } else {
+                upStepLog(taskId, 'base64', '图片转换异常，第'+(i+1)+'次', 'warn');
                 toast('图片转换异常');
             }
         } catch (e) {
@@ -83,6 +77,7 @@ function base64ToBitmap(base64Str) {
         }
         sleep(1500);
     }
+    upStepLog(taskId, 'base64', '图片转换失败，已重试10次', 'error'); // 步骤日志L04
     return false;
 }
 
@@ -170,8 +165,33 @@ function upResult(taskConfig, result = true, error = null) {
     }
 }
 
-function checkWxName(wxName) {
+/**
+ * 上报步骤日志到服务器（fire-and-forget，失败不重试）
+ * @param {string} taskId - 任务ID
+ * @param {string} step   - 步骤标识，如 "base64", "checkWx", "saoma"
+ * @param {string} msg    - 日志内容
+ * @param {string} level  - 日志级别: "info" | "warn" | "error"（可选，默认info）
+ */
+function upStepLog(taskId, step, msg, level = 'info') {
+    const url = `http://${config.serverIp}:8001/api/scan/step_log`;
+    const data = JSON.stringify({
+        task_id: taskId,
+        phone_id: config.deviceId,
+        step: step,
+        message: msg,
+        level: level,
+        timestamp: time()
+    });
+    try {
+        http.postJSON(url, data, 2000, null); // 2秒超时，不重试
+    } catch (e) {
+        loge('upStepLog: ' + e);
+    }
+}
+
+function checkWxName(wxName, taskId) {
     logw('检查当前登录的微信');
+    upStepLog(taskId, 'checkWx', '开始验证微信账号: ' + wxName); // 步骤日志L05
     const t = time();
     let num = 0;
     while (time() - t < 1000 * 100) {
@@ -201,7 +221,9 @@ function checkWxName(wxName) {
                     logd(nowWxName);
                     if (nowWxName) {
                         logd('当前微信: ' + nowWxName);
+                        upStepLog(taskId, 'checkWx', '当前账号:' + nowWxName + ' 目标:' + wxName); // 步骤日志L06
                         if (nowWxName === wxName) {
+                            upStepLog(taskId, 'checkWx', '微信账号确认正确'); // 步骤日志L07
                             return true;
                         } else {
                             if (jc.FindNode(text('设置').id('android:id/title').clz('android.widget.TextView'))) {
@@ -231,6 +253,7 @@ function checkWxName(wxName) {
         }
         sleep(1000);
     }
+    upStepLog(taskId, 'checkWx', '账号验证超时100s', 'error'); // 步骤日志L08
     return false;
 }
 
@@ -238,8 +261,9 @@ function checkWxName(wxName) {
  *
  * @return {number} -1扫码超时 1扫码成功 0需要人工介入
  */
-function saoma() {
+function saoma(taskId) {
     logw('扫码');
+    upStepLog(taskId, 'saoma', '开始扫码流程'); // 步骤日志L09
     const t = time();
     let num = 0;//app不在前台的次数
     let retVal = -1;
@@ -251,13 +275,16 @@ function saoma() {
         try {
             if (jc.FindNode(textMatch('已发送至 \\d+\\*+\\d+'))) {
                 loge('需要人工介入');
+                upStepLog(taskId, 'saoma', '触发人工介入条件', 'error'); // 步骤日志L14
                 retVal = 0;
                 break;
             } else if (jc.FindNode(text('申请获取并验证你的手机号'))) {
                 logd('达到手机号授权界面');
+                upStepLog(taskId, 'saoma', '检测到手机号授权弹窗'); // 步骤日志L11
                 if (jc.FindNode(textMatch('^(微信绑定号码|上次提供)$'))) {
                     logd('点击: ' + j_node.text);
                     j_node.click();
+                    upStepLog(taskId, 'saoma', '已点击授权手机号'); // 步骤日志L12
                     sleep(2000);
                 }
             } else if (jc.FindNode(text('请授权获取手机号进行验证 '))) {
@@ -295,6 +322,7 @@ function saoma() {
                         logd('点击: ' + j_node.desc);
                         j_node.click();
                         lastImageClickTime = time(); // 记录点击图片时间，用于检测授权弹窗超时
+                        upStepLog(taskId, 'saoma', '已点击相册图片，等待授权弹窗'); // 步骤日志L10
                         sleep(5000)
                     }
                 }
@@ -359,6 +387,7 @@ function saoma() {
                 !jc.FindNode(text('申请获取并验证你的手机号'))) {
                 retryCount++;
                 logw('点击图片后10秒未检测到授权弹窗，第' + retryCount + '次重试');
+                upStepLog(taskId, 'saoma', '授权弹窗超时，重试第'+retryCount+'次', 'warn'); // 步骤日志L13
                 if (retryCount >= 2) {
                     loge('重试2次仍未弹出授权窗口');
                     retVal = 0;
@@ -376,6 +405,9 @@ function saoma() {
         image.recycleAllImage()
         sleep(800);
     }
+    if (retVal === -1) {
+        upStepLog(taskId, 'saoma', '扫码超时退出，等待130s无结果', 'error'); // 步骤日志L15
+    }
     return retVal;
 }
 
@@ -387,6 +419,7 @@ function main() {
         exit();
     }
     toast('正在启动中...');
+    logi('当前版本号: ' + config.version); // 启动时打印版本号
     initConfig();
     //这个是设置整体日志窗口的
     const logView = {
@@ -511,10 +544,11 @@ function main() {
                 resultUploaded = false; // 新任务前重置提交标记
                 scanTaskSnapshot = null; // 清除旧任务快照，防止残留的旧结果被误报
                 taskConfig = getScan(config.deviceId);
+                upStepLog(taskConfig.taskId, 'main', '任务开始处理，微信号:' + taskConfig.wxName); // 步骤日志L01
                 config.step = 2;
                 break;  //获取任务
             case 2:
-                if (base64ToBitmap(taskConfig.base64Str)) {
+                if (base64ToBitmap(taskConfig.base64Str, taskConfig.taskId)) {
                     config.step = 3;
                 } else {
                     upResult(taskConfig, false, 'base64转二维码失败');
@@ -522,7 +556,7 @@ function main() {
                 }
                 break;  //图片转换
             case 3:
-                if (checkWxName(taskConfig.wxName)) {
+                if (checkWxName(taskConfig.wxName, taskConfig.taskId)) {
                     config.step = 4;
                 } else {
                     laoleng.app.accKillApp(config.pkgName);
@@ -535,7 +569,7 @@ function main() {
             case 4:
                 // 步骤4开始时保存当前任务快照，供后台线程使用
                 activeTaskSnapshot = {taskId: taskConfig.taskId, wxName: taskConfig.wxName};
-                scanResult = saoma();
+                scanResult = saoma(taskConfig.taskId);
                 // 后台线程没有提交过才由主线程提交
                 if (!resultUploaded) {
                     resultUploaded = true;
