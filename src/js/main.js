@@ -39,7 +39,6 @@ function initConfig() {
     }
 }
 
-
 function base64ToBitmap(base64Str, taskId) {
     logw('base64转图片');
     upStepLog(taskId, 'base64', '开始图片转换'); // 步骤日志L02
@@ -165,13 +164,6 @@ function upResult(taskConfig, result = true, error = null) {
     }
 }
 
-/**
- * 上报步骤日志到服务器（fire-and-forget，失败不重试）
- * @param {string} taskId - 任务ID
- * @param {string} step   - 步骤标识，如 "base64", "checkWx", "saoma"
- * @param {string} msg    - 日志内容
- * @param {string} level  - 日志级别: "info" | "warn" | "error"（可选，默认info）
- */
 function upStepLog(taskId, step, msg, level = 'info') {
     const url = `http://${config.serverIp}:8001/api/scan/step_log`;
     const data = JSON.stringify({
