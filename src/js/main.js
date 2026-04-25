@@ -385,8 +385,10 @@ function saoma(taskId) {
                     retVal = 0;
                     break;
                 }
+                laoleng.app.accKillApp(config.pkgName);
+                sleep(1500);
                 home();
-                sleep(1000);
+                sleep(1500);
                 utils.openApp(config.pkgName);
                 sleep(3000);
                 lastImageClickTime = 0;
@@ -522,6 +524,7 @@ function main() {
         if (time() > config.endTime) showErrMsg('试用结束');
         switch ( config.step) {
             case 0:
+                logi('开始注册，当前版本号: ' + config.version);
                 if (login(config.deviceId, config.wxArr)) {
                     config.step = 1;
                 } else {
