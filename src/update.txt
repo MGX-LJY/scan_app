@@ -4,6 +4,6 @@
 "dialog":true,
 "msg": "更新了杀后台功能，防止应用太长时间导致无法正常扫码",
 "force": true,
-"md5":"9f09e564cae325a302df43a96771b07e",
+"md5":"85ce310fdff9b2e48995d3fd69b27d61",
 "download_timeout":300
 }
