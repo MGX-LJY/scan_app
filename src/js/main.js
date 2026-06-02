@@ -99,7 +99,8 @@ function login(deviceId, wxArr) {
         "wechat_accounts": wxArr  // 必填，微信号列表arr类型
     });
     for (let i = 0; i < 10; i++) {
-        let res = http.postJSON(url, data, 1000, null);
+        // 内网穿透延迟/抖动大，超时给到15秒
+        let res = http.postJSON(url, data, 15000, null);
         try {
             logd(res);
             let ret = JSON.parse(res);
@@ -112,7 +113,8 @@ function login(deviceId, wxArr) {
         } catch (e) {
             loge('login: ' + e);
         }
-        sleep(1000);
+        // 递增退避：2s,4s,6s... 最多10s，避免隧道抖动时连环失败
+        sleep(Math.min((i + 1) * 2000, 10000));
     }
     return false;
 }
@@ -126,7 +128,7 @@ function getScan(deviceId) {
     const url = `${config.baseUrl}/api/scan/task?phone_id=${deviceId}`;
     while (true) {
         try {
-            let res = http.httpGetDefault(url, 1000, null);
+            let res = http.httpGetDefault(url, 15000, null);
             // logd(res);
             let ret = JSON.parse(res);
             if (ret.success && ret.has_task) {
@@ -158,7 +160,8 @@ function upResult(taskConfig, result = true, error = null) {
         "error": error                       // 选填，失败原因(成功时为null)
     });
     for (let i = 0; i < 5; i++) {
-        let res = http.postJSON(url, data, 1000, null);
+        // 内网穿透延迟/抖动大，超时给到15秒
+        let res = http.postJSON(url, data, 15000, null);
         try {
             logd(res);
             let ret = JSON.parse(res);
@@ -172,7 +175,8 @@ function upResult(taskConfig, result = true, error = null) {
         } catch (e) {
             loge('upResult: ' + e);
         }
-        sleep(1000);
+        // 递增退避：2s,4s,6s... 最多8s
+        sleep(Math.min((i + 1) * 2000, 8000));
     }
 }
 
@@ -187,7 +191,7 @@ function upStepLog(taskId, step, msg, level = 'info') {
         timestamp: time()
     });
     try {
-        http.postJSON(url, data, 2000, null); // 2秒超时，不重试
+        http.postJSON(url, data, 8000, null); // 8秒超时，不重试（步骤日志非关键）
     } catch (e) {
         loge('upStepLog: ' + e);
     }
