@@ -942,6 +942,24 @@ const jc = function () {
                             15000
                         );
                         if (updateResult) {
+                            // EasyClick 要求热更新版本为整数。即使 SDK 返回需要更新，
+                            // 仍在脚本层再次比较，避免同版本清单导致反复下载和重启。
+                            let updateResp = hotupdater.getUpdateResp();
+                            let remoteVersion;
+                            try {
+                                remoteVersion = Number(JSON.parse(updateResp).version);
+                            } catch (parseError) {
+                                loge('更新清单解析失败: ' + parseError);
+                                continue;
+                            }
+                            let currentVersion = Number(obj.version);
+                            if (!isFinite(remoteVersion) || !isFinite(currentVersion)
+                                || remoteVersion <= currentVersion) {
+                                logw('忽略无效或非新版本更新，本地: ' + currentVersion
+                                    + '，远端: ' + remoteVersion);
+                                continue;
+                            }
+
                             // 请求版本信息期间可能恰好领取到任务，下载前再次确认。
                             if (canUpdate && !canUpdate()) {
                                 logw('检测到新版本，但当前已有扫码任务，本轮更新延期');

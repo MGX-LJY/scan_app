@@ -17,7 +17,7 @@ let config = {
     pauseResultWatcher: false, // 主线程操作系统设置时暂停后台节点查询，避免节点缓存竞态
     updateInProgress: false,  // 热更新检查/下载期间暂停领取新任务
     pollingTask: false,       // 正在请求扫码任务，防止更新与任务分配竞态
-    version: JSON.parse(readIECFileAsString('update.json')).version // IEC内置版本号
+    version: JSON.parse(readIECFileAsString('update.json')).version_name || JSON.parse(readIECFileAsString('update.json')).version // 用户可见版本号
 };
 
 // const sto = storages.create('arr');

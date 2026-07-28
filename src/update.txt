@@ -1,6 +1,6 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":1.42,
+"version":142,
 "dialog":false,
 "msg": "测试自动更新",
 "force": true,

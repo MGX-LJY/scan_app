@@ -14,7 +14,8 @@ function main() {
     ui.layout("使用说明", "shiYongShuoMing.xml");
 
     // ProgressCustialog()
-    let version = JSON.parse(readIECFileAsString('update.json')).version;
+    let updateConfig = JSON.parse(readIECFileAsString('update.json'));
+    let version = updateConfig.version_name || updateConfig.version;
     ui.version.setText('版本号: ' + version);
     ui.resetUIVar();
     initView();
