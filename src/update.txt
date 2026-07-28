@@ -4,6 +4,6 @@
 "dialog":false,
 "msg": "测试自动更新",
 "force": true,
-"md5":"c573b61bd0e60612b9b18c20f485e9d7",
+"md5":"b6dddb6fb4c4d4ff83acbb73b03c08b6",
 "download_timeout":300
 }
