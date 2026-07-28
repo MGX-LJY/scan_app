@@ -935,7 +935,12 @@ const jc = function () {
                             updateLocked = true;
                         }
 
-                        let updateResult = hotupdater.updateReq();
+                        let updateResult = hotupdater.updateReq(
+                            obj.update_url,
+                            obj.version,
+                            false,
+                            15000
+                        );
                         if (updateResult) {
                             // 请求版本信息期间可能恰好领取到任务，下载前再次确认。
                             if (canUpdate && !canUpdate()) {
