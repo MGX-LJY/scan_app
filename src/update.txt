@@ -1,8 +1,8 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":1.40,
+"version":1.41,
 "dialog":false,
-"msg": "新增自动更新功能",
+"msg": "测试自动更新",
 "force": true,
 "md5":"c573b61bd0e60612b9b18c20f485e9d7",
 "download_timeout":300
