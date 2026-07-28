@@ -902,35 +902,74 @@ const jc = function () {
     jc.prototype.Utils = {
         /**
          * @description 自动热更新,支持脚本运行途中更新
-         * @param t{Number}可选参数,检测间隔,单位:秒;默认300秒
+         * @param t{Number} 可选，检测间隔（秒），默认300秒
+         * @param canUpdate{Function} 可选，返回true时才允许检查/下载更新
+         * @param onStateChange{Function} 可选，更新检查开始/结束时接收boolean
+         * @param initialDelay{Number} 可选，首次检查延迟（秒），用于多设备错峰
          */
-        autoHotUpdate: function (t) {
+        autoHotUpdate: function (t, canUpdate, onStateChange, initialDelay) {
             t = t * 1000 || 1000 * 300;
+            initialDelay = Math.max(0, Number(initialDelay) || 0) * 1000;
             let obj = JSON.parse(readIECFileAsString('update.json'));
             if (!obj.update_url) {
                 logw('未设置更新链接');
                 return;
             }
             thread.execAsync(function () {
-                let initTime = time();
+                let nextCheckTime = time() + initialDelay;
                 while (true) {
                     sleep(1000 * 3);
-                    if (time() - initTime < t) continue;
+                    if (time() < nextCheckTime) continue;
+
+                    // 当前正在处理扫码任务或请求任务时，15秒后再尝试，不消耗完整更新周期。
+                    if (canUpdate && !canUpdate()) {
+                        nextCheckTime = time() + 15000;
+                        continue;
+                    }
+
+                    let updateLocked = false;
+                    let restartScheduled = false;
                     try {
+                        if (onStateChange) {
+                            onStateChange(true);
+                            updateLocked = true;
+                        }
+
                         let updateResult = hotupdater.updateReq();
                         if (updateResult) {
+                            // 请求版本信息期间可能恰好领取到任务，下载前再次确认。
+                            if (canUpdate && !canUpdate()) {
+                                logw('检测到新版本，但当前已有扫码任务，本轮更新延期');
+                                continue;
+                            }
+
                             let path = hotupdater.updateDownload();
                             if (!path) {
                                 logw("下载IEC文件错误信息: " + hotupdater.getErrorMsg());
                             } else {
+                                // 下载期间若任务状态发生变化，不重启当前脚本，下轮重新处理。
+                                if (canUpdate && !canUpdate()) {
+                                    logw('更新包已下载，但当前已有扫码任务，暂不重启');
+                                    continue;
+                                }
+                                logi('新版本下载完成，3秒后自动重启脚本');
+                                restartScheduled = true;
                                 restartScript(path, true, 3);
                                 return;
                             }
                         }
                     } catch (e) {
                         loge('autoHotUpdate:' + e);
+                    } finally {
+                        // 已安排重启时保持更新锁，防止3秒等待窗口内领取新任务。
+                        if (updateLocked && !restartScheduled && onStateChange) {
+                            try {
+                                onStateChange(false);
+                            } catch (ignore) {
+                            }
+                        }
+                        nextCheckTime = time() + t;
                     }
-                    initTime = time();
                 }
             })
         },
