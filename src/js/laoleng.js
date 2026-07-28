@@ -1344,32 +1344,90 @@ laoleng.app.isRunningPkg = function (pkgName) {
  */
 laoleng.app.accKillApp = function (pkgName) {
     logi(">>accKillApp")
-    homes()
-    this.openAppSetting(pkgName)
-    sleep(1000)
-    let timeOut = 0
-    while (true) {
-        keepNode()
-        if (findNode(textMatch("^强行停止$|^强行结束$|^结束运行$"))) {
-            logd("强行停止")
-            if (g_ret.enabled) {
-                findClickEx()
-                timeOut++
-                if (timeOut >= 5) {
+    const stopSelector = textMatch("^强行停止$|^强行结束$|^结束运行$")
+    const deadline = time() + 12000
+    let settingOpened = false
+    let stopClicked = false
+
+    try {
+        homes()
+        settingOpened = !!this.openAppSetting(pkgName)
+        if (!settingOpened) {
+            logw("打开应用设置页失败: " + pkgName)
+            return false
+        }
+        sleep(1000)
+
+        while (time() < deadline) {
+            // 每轮获取局部节点对象，不再通过跨线程共享的 g_ret 读取 enabled 属性。
+            keepNode(true)
+            // 确认弹窗可能覆盖在应用设置页之上，应优先处理，避免重复点击底层强停按钮。
+            let confirmNode = text("确定").getOneNodeInfo(200)
+            if (confirmNode) {
+                logd("确认强行停止")
+                try {
+                    if (findClickEx(confirmNode)) {
+                        stopClicked = true
+                        sleep(500)
+                        continue
+                    }
+                } catch (confirmError) {
+                    logw("点击确定按钮异常: " + confirmError)
+                }
+            }
+
+            let stopNode = stopSelector.getOneNodeInfo(300)
+            if (stopNode) {
+                logd("找到强行停止按钮")
+                let clicked = false
+                try {
+                    clicked = !!findClickEx(stopNode)
+                } catch (clickError) {
+                    logw("点击强行停止按钮异常: " + clickError)
+                }
+
+                if (clicked) {
+                    stopClicked = true
+                    sleep(500)
+                    continue
+                }
+
+                // 按钮存在但无法点击，通常表示应用已停止。
+                if (stopClicked) {
+                    logi("微信强行停止已生效")
                     backs()
-                    releaseNode()
-                    return false
+                    return true
                 }
             } else {
-                backs()
-                releaseNode()
-                return true
+                let systemDialogNode = desc("打开设置。").pkg("com.android.systemui").getOneNodeInfo(100)
+                if (systemDialogNode) {
+                    logd("检测到系统设置提示框")
+                    backs()
+                    sleep(300)
+                } else if (stopClicked) {
+                    // 已点击过强停/确认，按钮短暂消失可视为操作完成。
+                    logi("微信强行停止完成")
+                    backs()
+                    return true
+                }
             }
-        } else if (findNode(text("确定"), true)) {
-            logd("确定")
-        } else if (findNode(desc("打开设置。").pkg("com.android.systemui"))) {
-            logd("打开了设置框")
+            sleep(300)
+        }
+
+        logw("强行停止微信超时")
+        backs()
+        return false
+    } catch (e) {
+        loge("accKillApp异常: " + e)
+        try {
             backs()
+        } catch (ignore) {
+        }
+        return false
+    } finally {
+        try {
+            releaseNode()
+        } catch (ignore) {
         }
     }
 }

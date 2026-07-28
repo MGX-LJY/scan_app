@@ -14,7 +14,10 @@ let config = {
     baseUrl: '',      // 规范化后的服务器根地址，如 http://xxx.zicp.vip:23456
     wxArr: [],
     step:0,
-    version: '1.31' // 版本号
+    pauseResultWatcher: false, // 主线程操作系统设置时暂停后台节点查询，避免节点缓存竞态
+    updateInProgress: false,  // 热更新检查/下载期间暂停领取新任务
+    pollingTask: false,       // 正在请求扫码任务，防止更新与任务分配竞态
+    version: JSON.parse(readIECFileAsString('update.json')).version // IEC内置版本号
 };
 
 // const sto = storages.create('arr');
@@ -96,7 +99,8 @@ function login(deviceId, wxArr) {
     const url = `${config.baseUrl}/api/phone/login`;
     const data = JSON.stringify({
         "phone_id": deviceId,           // 必填，手机唯一ID
-        "wechat_accounts": wxArr  // 必填，微信号列表arr类型
+        "wechat_accounts": wxArr,  // 必填，微信号列表arr类型
+        "app_version": config.version
     });
     for (let i = 0; i < 10; i++) {
         // 内网穿透延迟/抖动大，超时给到15秒
@@ -127,11 +131,18 @@ function getScan(deviceId) {
     // }
     const url = `${config.baseUrl}/api/scan/task?phone_id=${deviceId}`;
     while (true) {
+        if (config.updateInProgress) {
+            logi('热更新检查中，暂停领取扫码任务');
+            return null;
+        }
         try {
+            config.pollingTask = true;
             let res = http.httpGetDefault(url, 15000, null);
             // logd(res);
             let ret = JSON.parse(res);
             if (ret.success && ret.has_task) {
+                // 收到任务后立即进入处理中状态，关闭热更新窗口。
+                config.step = 2;
                 return {
                     base64Str: ret.task.qrcode_base64,
                     taskId: ret.task.task_id,
@@ -144,6 +155,8 @@ function getScan(deviceId) {
         } catch (e) {
             loge('getScan: ' + e);
             toast('返回异常\n服务端可能没连上\n'+e);
+        } finally {
+            config.pollingTask = false;
         }
         sleep(3000);
     }
@@ -194,6 +207,66 @@ function upStepLog(taskId, step, msg, level = 'info') {
         http.postJSON(url, data, 8000, null); // 8秒超时，不重试（步骤日志非关键）
     } catch (e) {
         loge('upStepLog: ' + e);
+    }
+}
+
+/**
+ * 安全重启微信。
+ * accKillApp 会进入系统设置并操作无障碍节点，执行期间必须暂停后台结果检测线程，
+ * 否则后台线程的 releaseNode/findNode 会使主线程持有的节点失效。
+ */
+function restartWechatSafely(reason, taskId) {
+    logw('准备重启微信: ' + reason);
+    if (taskId) {
+        upStepLog(taskId, 'restartWx', '准备重启微信: ' + reason, 'warn');
+    }
+
+    config.pauseResultWatcher = true;
+    // 后台结果线程每200ms轮询一次，等待它完成当前轮节点操作。
+    sleep(350);
+
+    let killed = false;
+    try {
+        killed = laoleng.app.accKillApp(config.pkgName);
+        if (!killed) {
+            logw('无障碍强停微信未确认成功，继续尝试回到桌面并重新打开');
+            if (taskId) {
+                upStepLog(taskId, 'restartWx', '强停微信未确认成功，尝试直接重新打开', 'warn');
+            }
+        }
+
+        home();
+        sleep(1500);
+        utils.openApp(config.pkgName);
+        sleep(3000);
+
+        if (taskId) {
+            upStepLog(taskId, 'restartWx', '微信已重新打开');
+        }
+        return true;
+    } catch (e) {
+        loge('安全重启微信异常: ' + e);
+        if (taskId) {
+            upStepLog(taskId, 'restartWx', '重启微信异常: ' + e, 'error');
+        }
+
+        // 最后再做一次不依赖节点的桌面恢复，避免停留在系统设置页。
+        try {
+            home();
+            sleep(1000);
+            utils.openApp(config.pkgName);
+            sleep(3000);
+        } catch (recoveryError) {
+            loge('微信恢复失败: ' + recoveryError);
+            return false;
+        }
+        return false;
+    } finally {
+        try {
+            releaseNode();
+        } catch (ignore) {
+        }
+        config.pauseResultWatcher = false;
     }
 }
 
@@ -401,12 +474,12 @@ function saoma(taskId) {
                     retVal = 0;
                     break;
                 }
-                laoleng.app.accKillApp(config.pkgName);
-                sleep(1500);
-                home();
-                sleep(1500);
-                utils.openApp(config.pkgName);
-                sleep(3000);
+                if (!restartWechatSafely('授权弹窗超时', taskId)) {
+                    loge('授权弹窗超时后重启微信失败');
+                    upStepLog(taskId, 'saoma', '授权弹窗超时且重启微信失败', 'error');
+                    retVal = 0;
+                    break;
+                }
                 lastImageClickTime = 0;
             } else {
                 lastImageClickTime = 0;
@@ -479,6 +552,24 @@ function main() {
     shell.execCommand('settings put global block_untrusted_touches 0');//设置点击穿透
     shell.execCommand('am compat disable BLOCK_UNTRUSTED_TOUCHES ' + jc.App.getMyAppPkgName());//设置点击穿透
 
+    // 12台手机按设备ID错峰0~119秒检查，之后每5分钟检查一次。
+    let updateStagger = 0;
+    for (let i = 0; i < config.deviceId.length; i++) {
+        updateStagger = (updateStagger + config.deviceId.charCodeAt(i)) % 120;
+    }
+    jc.Utils.autoHotUpdate(
+        300,
+        function () {
+            return config.step === 1 && !config.pollingTask;
+        },
+        function (updating) {
+            config.updateInProgress = updating;
+            logi(updating ? '开始检查脚本更新，暂停领取任务' : '脚本更新检查结束，恢复任务轮询');
+        },
+        updateStagger
+    );
+    logi('自动更新已启用，首次检查延迟: ' + updateStagger + '秒');
+
 
     let taskConfig = {};
     let scanResult = -999;
@@ -487,26 +578,43 @@ function main() {
     let activeTaskSnapshot = null; // 步骤4开始时保存的任务快照，确保后台线程只上报当前正在扫码的任务
     thread.execAsync(function () {
         while (true) {
-            releaseNode();
-            removeNodeFlag(0);
-            lockNode();
-            // 只有在步骤4且有活跃任务快照时才处理结果节点
-            if (config.step === 4 && activeTaskSnapshot && !scanTaskSnapshot) {
-                if (findNode(text('验证成功').clz('android.widget.TextView').pkg(config.pkgName))) {
-                    logd('验证成功');
-                    scanResult = 1;
-                    // 使用步骤4开始时保存的快照，而不是当前的taskConfig
-                    scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
-                } else if (findNode(text('解锁成功').clz('android.widget.TextView').pkg(config.pkgName))) {
-                    logd('解锁成功');
-                    scanResult = 1;
-                    scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
-                } else if (findNode(text('验证失败').clz('android.widget.TextView').pkg(config.pkgName))) {
-                    logd('验证失败');
-                    scanResult = 0;
-                    scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
+            if (config.pauseResultWatcher) {
+                sleep(200);
+                continue;
+            }
+
+            try {
+                releaseNode();
+                removeNodeFlag(0);
+                lockNode();
+
+                // 暂停标志可能在本轮节点初始化期间发生变化，操作节点前再次确认。
+                if (!config.pauseResultWatcher &&
+                    config.step === 4 && activeTaskSnapshot && !scanTaskSnapshot) {
+                    if (findNode(text('验证成功').clz('android.widget.TextView').pkg(config.pkgName))) {
+                        logd('验证成功');
+                        scanResult = 1;
+                        // 使用步骤4开始时保存的快照，而不是当前的taskConfig
+                        scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
+                    } else if (findNode(text('解锁成功').clz('android.widget.TextView').pkg(config.pkgName))) {
+                        logd('解锁成功');
+                        scanResult = 1;
+                        scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
+                    } else if (findNode(text('验证失败').clz('android.widget.TextView').pkg(config.pkgName))) {
+                        logd('验证失败');
+                        scanResult = 0;
+                        scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
+                    }
+                }
+            } catch (watchError) {
+                loge('结果检测线程异常: ' + watchError);
+            } finally {
+                try {
+                    releaseNode();
+                } catch (ignore) {
                 }
             }
+
             // 上报结果
             if (scanResult !== -999 && !resultUploaded && scanTaskSnapshot) {
                 resultUploaded = true;
@@ -554,7 +662,15 @@ function main() {
                  */
                 resultUploaded = false; // 新任务前重置提交标记
                 scanTaskSnapshot = null; // 清除旧任务快照，防止残留的旧结果被误报
+                if (config.updateInProgress) {
+                    sleep(1000);
+                    break;
+                }
                 taskConfig = getScan(config.deviceId);
+                if (!taskConfig) {
+                    sleep(1000);
+                    break;
+                }
                 upStepLog(taskConfig.taskId, 'main', '任务开始处理，微信号:' + taskConfig.wxName); // 步骤日志L01
                 config.step = 2;
                 break;  //获取任务
@@ -570,11 +686,10 @@ function main() {
                 if (checkWxName(taskConfig.wxName, taskConfig.taskId)) {
                     config.step = 4;
                 } else {
-                    laoleng.app.accKillApp(config.pkgName);
-                    sleep(1500);
-                    home();
-                    sleep(1500);
-                    utils.openApp(config.pkgName)
+                    if (!restartWechatSafely('账号验证超时', taskConfig.taskId)) {
+                        upResult(taskConfig, false, '账号验证超时且重启微信失败');
+                        config.step = 1;
+                    }
                 }
                 break;  //检查当前微信号是否是任务需要的微信号
             case 4:
