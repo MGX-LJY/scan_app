@@ -345,23 +345,54 @@ function checkWxName(wxName, taskId) {
 function saoma(taskId) {
     logw('扫码');
     upStepLog(taskId, 'saoma', '开始扫码流程'); // 步骤日志L09
+    config.scanFailureReason = null;
     const t = time();
+    const maxScanDuration = 1000 * 240; // 必须小于服务端5分钟的活跃任务识别窗口
+    const maxRecoveryCount = 2; // 超时和“验证失败”合计最多自动恢复2次
     let num = 0;//app不在前台的次数
     let retVal = -1;
     let lastImageClickTime = 0; // 记录点击相册图片的时间戳
-    let retryCount = 0; // 授权弹窗未弹出的重试计数
-    while (time() - t < 1000 * 130) {
+    let recoveryCount = 0;
+    while (time() - t < maxScanDuration) {
         if ( config.step!==4) return -999
+
+        // “验证失败”经常是微信侧瞬时状态，同一任务立即重扫通常可以成功。
+        // 后台线程只负责发现结果，重启微信和重扫必须由主线程执行，避免节点锁竞态。
+        if (config.validationFailurePending) {
+            config.validationFailurePending = false;
+            recoveryCount++;
+            if (recoveryCount > maxRecoveryCount) {
+                loge('验证失败，已达到自动恢复上限');
+                upStepLog(taskId, 'saoma', '验证失败，自动恢复已达上限' + maxRecoveryCount + '次', 'error');
+                config.scanFailureReason = '验证失败，自动恢复' + maxRecoveryCount + '次后仍失败';
+                retVal = 0;
+                break;
+            }
+            logw('检测到验证失败，开始第' + recoveryCount + '次自动恢复');
+            upStepLog(taskId, 'saoma', '检测到验证失败，自动恢复第' + recoveryCount + '次', 'warn');
+            if (!restartWechatSafely('验证失败自动恢复', taskId)) {
+                upStepLog(taskId, 'saoma', '验证失败后重启微信失败', 'error');
+                config.scanFailureReason = '验证失败，自动恢复时重启微信失败';
+                retVal = 0;
+                break;
+            }
+            // 重启期间旧失败页可能被后台线程再识别一次，重启完成后丢弃该旧信号。
+            config.validationFailurePending = false;
+            lastImageClickTime = 0;
+            continue;
+        }
         keepScreen();
         try {
             if (jc.FindNode(textMatch('已发送至 \\d+\\*+\\d+'))) {
                 loge('需要人工介入');
                 upStepLog(taskId, 'saoma', '触发人工介入条件', 'error'); // 步骤日志L14
+                config.scanFailureReason = '二维码已发送至其他手机号，需要人工介入';
                 retVal = 0;
                 break;
             } else if (jc.FindNode(text('申请获取并验证你的手机号'))) {
                 logd('达到手机号授权界面');
                 upStepLog(taskId, 'saoma', '检测到手机号授权弹窗'); // 步骤日志L11
+                lastImageClickTime = 0; // 授权弹窗已出现，停止“未出现弹窗”超时恢复
                 if (jc.FindNode(textMatch('^(微信绑定号码|上次提供)$'))) {
                     logd('点击: ' + j_node.text);
                     j_node.click();
@@ -369,20 +400,24 @@ function saoma(taskId) {
                     sleep(2000);
                 }
             } else if (jc.FindNode(text('请授权获取手机号进行验证 '))) {
+                lastImageClickTime = 0;
                 logd('点击: ' + j_node.text);
                 j_node.click();
                 sleep(3000);
             } else if (jc.FindNode(text('解锁'))) {
+                lastImageClickTime = 0;
                 logd('点击: 解锁');
                 j_node.click();
                 sleep(3000);
             } else if (findImage('授权手机号', 193, 915, 914, 1363)) {
                 //这个是对上面的补充，上面节点有时候找不到
+                lastImageClickTime = 0;
                 logd('点击: 授权手机号');
                 clickPoint(gPoint.x, gPoint.y)
                 sleep(3000);
             } else if (findImage('解锁按钮', 414, 1300, 620, 1372)) {
                 //这个是对上面的补充，上面节点有时候找不到
+                lastImageClickTime = 0;
                 logd('点击: 解锁(图像识别)');
                 clickPoint(gPoint.x, gPoint.y)
                 sleep(3000);
@@ -462,24 +497,34 @@ function saoma(taskId) {
         } catch (e) {
             loge('demo: ' + e);
         }
-        // 点击图片后10秒未出现授权弹窗，返回桌面重新打开微信重试
-        if (lastImageClickTime > 0 && time() - lastImageClickTime > 10000) {
+        // 后台线程可能在本轮节点查询期间已经确认成功并切回步骤1，禁止再执行超时重启。
+        if (config.step !== 4) return -999;
+        // 失败信号优先交给下一轮顶部统一处理，不能同时触发授权超时恢复并重复计数。
+        if (config.validationFailurePending) {
+            image.recycleAllImage();
+            continue;
+        }
+        // 微信授权页偶尔加载较慢，留出20秒后再执行恢复，避免过早杀掉仍在处理的微信。
+        if (lastImageClickTime > 0 && time() - lastImageClickTime > 20000) {
             if (!jc.FindNode(text('请授权获取手机号进行验证 ')) &&
                 !jc.FindNode(text('申请获取并验证你的手机号'))) {
-                retryCount++;
-                logw('点击图片后10秒未检测到授权弹窗，第' + retryCount + '次重试');
-                upStepLog(taskId, 'saoma', '授权弹窗超时，重试第'+retryCount+'次', 'warn'); // 步骤日志L13
-                if (retryCount >= 2) {
-                    loge('重试2次仍未弹出授权窗口');
+                recoveryCount++;
+                logw('点击图片后20秒未检测到授权弹窗，第' + recoveryCount + '次自动恢复');
+                upStepLog(taskId, 'saoma', '授权弹窗超时，自动恢复第'+recoveryCount+'次', 'warn'); // 步骤日志L13
+                if (recoveryCount > maxRecoveryCount) {
+                    loge('授权弹窗超时，已达到自动恢复上限');
+                    config.scanFailureReason = '授权弹窗超时，自动恢复' + maxRecoveryCount + '次后仍失败';
                     retVal = 0;
                     break;
                 }
                 if (!restartWechatSafely('授权弹窗超时', taskId)) {
                     loge('授权弹窗超时后重启微信失败');
                     upStepLog(taskId, 'saoma', '授权弹窗超时且重启微信失败', 'error');
+                    config.scanFailureReason = '授权弹窗超时且重启微信失败';
                     retVal = 0;
                     break;
                 }
+                config.validationFailurePending = false;
                 lastImageClickTime = 0;
             } else {
                 lastImageClickTime = 0;
@@ -489,7 +534,7 @@ function saoma(taskId) {
         sleep(800);
     }
     if (retVal === -1) {
-        upStepLog(taskId, 'saoma', '扫码超时退出，等待130s无结果', 'error'); // 步骤日志L15
+        upStepLog(taskId, 'saoma', '扫码超时退出，等待240s无结果', 'error'); // 步骤日志L15
     }
     return retVal;
 }
@@ -576,6 +621,7 @@ function main() {
     let resultUploaded = false; // 防止后台线程和主线程双重提交结果
     let scanTaskSnapshot = null; // 检测到结果时立即保存任务快照，防止竞态条件
     let activeTaskSnapshot = null; // 步骤4开始时保存的任务快照，确保后台线程只上报当前正在扫码的任务
+    config.validationFailurePending = false; // 验证失败由主线程恢复，后台线程不得直接结束任务
     thread.execAsync(function () {
         while (true) {
             if (config.pauseResultWatcher) {
@@ -602,8 +648,7 @@ function main() {
                         scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
                     } else if (findNode(text('验证失败').clz('android.widget.TextView').pkg(config.pkgName))) {
                         logd('验证失败');
-                        scanResult = 0;
-                        scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
+                        config.validationFailurePending = true;
                     }
                 }
             } catch (watchError) {
@@ -662,6 +707,7 @@ function main() {
                  */
                 resultUploaded = false; // 新任务前重置提交标记
                 scanTaskSnapshot = null; // 清除旧任务快照，防止残留的旧结果被误报
+                config.validationFailurePending = false;
                 if (config.updateInProgress) {
                     sleep(1000);
                     break;
@@ -695,6 +741,7 @@ function main() {
             case 4:
                 // 步骤4开始时保存当前任务快照，供后台线程使用
                 activeTaskSnapshot = {taskId: taskConfig.taskId, wxName: taskConfig.wxName};
+                config.validationFailurePending = false;
                 scanResult = saoma(taskConfig.taskId);
                 // 后台线程没有提交过才由主线程提交
                 if (!resultUploaded) {
@@ -702,7 +749,7 @@ function main() {
                     if (scanResult === 1) {
                         upResult(activeTaskSnapshot);
                     } else if (scanResult === 0) {
-                        upResult(activeTaskSnapshot, false, '验证失败,需要人工介入');
+                        upResult(activeTaskSnapshot, false, config.scanFailureReason || '扫码失败，需要人工介入');
                     } else if (scanResult === -1) {
                         upResult(activeTaskSnapshot, false, '验证超时');
                     }
