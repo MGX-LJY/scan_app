@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":142,
+"version":143,
 "dialog":false,
-"msg": "测试自动更新",
+"msg": "修复扫码失败自动恢复",
 "force": true,
-"md5":"fc55ffe4b6921984f7f6e1b64b8bcd4a",
+"md5":"5e467c6fb0fae87544fd7b866224d3f0",
 "download_timeout":300
 }
