@@ -1,3 +1,5 @@
+const SCAN_SERVER_BASE_URL = 'https://scan.mgxnet.com';
+
 let config = {
     scX: ~~device.getScreenWidth(),
     scY: ~~device.getScreenHeight(),
@@ -10,8 +12,7 @@ let config = {
     scriptPkg: 'com.tx.saoma',//脚本包名
     logPath: '/sdcard/红包助手.txt',//日志保存路径
     deviceId: '',
-    serverIp: '',     // 用户输入的原始内容（现在应填完整地址，兼容旧字段名）
-    baseUrl: '',      // 规范化后的服务器根地址，如 http://xxx.zicp.vip:23456
+    baseUrl: SCAN_SERVER_BASE_URL, // 固定公网主地址，不再读取手机端遗留配置
     wxArr: [],
     step:0,
     pauseResultWatcher: false, // 主线程操作系统设置时暂停后台节点查询，避免节点缓存竞态
@@ -29,21 +30,8 @@ function showErrMsg(msg) {
     exit();
 }
 
-// 把用户输入规范成 http(s)://host[:port] 形式，去掉末尾斜杠
-// 兼容：xxx.zicp.vip:23456 / http://xxx.zicp.vip:23456 / https://xxx.zicp.vip
-function normalizeBaseUrl(s) {
-    s = String(s).trim();
-    if (!s) return '';
-    if (!/^https?:\/\//i.test(s)) s = 'http://' + s; // 没写协议默认补 http://
-    s = s.replace(/\/+$/, '');                       // 去掉末尾所有斜杠
-    return s;
-}
-
 function initConfig() {
     config.deviceId = readConfigString('deviceId');
-    config.serverIp = readConfigString('serverIp').trim();
-    if (!config.serverIp) showErrMsg('请先填写服务器地址');
-    config.baseUrl = normalizeBaseUrl(config.serverIp);
     const wxArr = readConfigString('weixinArr').trim();
     if (!wxArr) showErrMsg('请先填写帐号保存路径');
     config.wxArr = wxArr.split('#');

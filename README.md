@@ -76,11 +76,8 @@ adb install build/release.iec
 
 ### 服务器配置
 
-在应用首次启动时配置：
-
-- **服务器地址**: 扫码服务器的 IP 地址
-- **端口**: 默认 8001
-- **设备ID**: 自动生成或手动输入
+- **服务器地址**: 固定使用 `https://scan.mgxnet.com`，手机端无需填写
+- **设备ID**: 自动生成
 - **微信账号**: 配置1-2个微信账号名称
 
 ### 配置文件
@@ -94,7 +91,7 @@ adb install build/release.iec
 
 ### 服务器端点
 
-**基础URL**: `http://{serverIp}:8001/api/`
+**基础URL**: `https://scan.mgxnet.com/api/`
 
 #### 1. 设备注册
 ```http
