@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":144,
+"version":145,
 "dialog":false,
-"msg": "固定扫码服务器主域名",
+"msg": "修复扫码授权卡死自动恢复",
 "force": true,
-"md5":"5222b402b208ef4caf5999a8bc37f626",
+"md5":"154adee78eeb302e4cba70a098f590ab",
 "download_timeout":300
 }
