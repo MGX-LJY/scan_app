@@ -135,6 +135,8 @@ function getScan(deviceId) {
                     base64Str: ret.task.qrcode_base64,
                     taskId: ret.task.task_id,
                     wxName: ret.task.wechat_nickname,
+                    dispatchToken: ret.task.dispatch_token,
+                    ackRequired: ret.task.ack_required === true,
                     // 服务端活跃任务窗口为5分钟，手机端预留约30秒给最终结果上报。
                     taskDeadline: time() + 270000
                 }
@@ -150,6 +152,32 @@ function getScan(deviceId) {
         }
         sleep(3000);
     }
+}
+
+function ackScanTask(taskConfig) {
+    if (!taskConfig.ackRequired) return true;
+    const url = `${config.baseUrl}/api/scan/task/ack`;
+    const data = JSON.stringify({
+        task_id: taskConfig.taskId,
+        phone_id: config.deviceId,
+        dispatch_token: taskConfig.dispatchToken
+    });
+    for (let i = 0; i < 4; i++) {
+        try {
+            let res = http.postJSON(url, data, 8000, null);
+            let ret = JSON.parse(res);
+            if (ret.success) {
+                // 服务器从ACK时刻开始计时；本地再预留10秒，saoma内部另预留20秒上报时间。
+                if (ret.task_deadline) taskConfig.taskDeadline = ret.task_deadline - 10000;
+                return true;
+            }
+            logw('任务确认被拒绝: ' + ret.message);
+        } catch (e) {
+            loge('ackScanTask: ' + e);
+        }
+        sleep(Math.min((i + 1) * 1500, 5000));
+    }
+    return false;
 }
 
 function upResult(taskConfig, result = true, error = null) {
@@ -733,6 +761,14 @@ function main() {
                 }
                 taskConfig = getScan(config.deviceId);
                 if (!taskConfig) {
+                    sleep(1000);
+                    break;
+                }
+                if (!ackScanTask(taskConfig)) {
+                    // 未ACK时绝不开始扫码；下一轮会幂等地重新拿到同一租约。
+                    logw('任务确认失败，暂不处理，等待重试: ' + taskConfig.taskId);
+                    taskConfig = null;
+                    config.step = 1;
                     sleep(1000);
                     break;
                 }
