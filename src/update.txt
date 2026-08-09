@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":145,
+"version":146,
 "dialog":false,
-"msg": "修复扫码授权卡死自动恢复",
+"msg": "修复手机领取任务时网络中断导致任务丢失",
 "force": true,
-"md5":"154adee78eeb302e4cba70a098f590ab",
+"md5":"d7bbe2ecf2a5b093894b266d0bd0807f",
 "download_timeout":300
 }
