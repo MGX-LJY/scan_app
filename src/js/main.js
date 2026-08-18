@@ -288,14 +288,25 @@ function restartWechatSafely(reason, taskId) {
     }
 }
 
-function checkWxName(wxName, taskId) {
+function detectWechatLoggedOut() {
+    const loggedOutText = textMatch('^(登录|手机号登录|微信号/QQ号/邮箱登录|用微信号/QQ号/邮箱登录|重新登录|安全验证)$').pkg(config.pkgName);
+    const riskText = textMatch('.*(帐号已退出|账号已退出|登录已过期|登录环境异常|存在安全风险|被盗风险|限制登录|解除限制).*').pkg(config.pkgName);
+    return jc.FindNode(loggedOutText) || jc.FindNode(riskText);
+}
+
+function checkWxName(wxName, taskId, taskDeadline) {
     logw('检查当前登录的微信');
     upStepLog(taskId, 'checkWx', '开始验证微信账号: ' + wxName); // 步骤日志L05
     const t = time();
+    // 账号检查也必须服从任务总时限，并给失败结果上报至少预留20秒。
+    const checkDeadline = taskDeadline ? Math.min(t + 1000 * 100, taskDeadline - 20000) : t + 1000 * 100;
     let num = 0;
-    while (time() - t < 1000 * 100) {
+    while (time() < checkDeadline) {
         try {
-            if (jc.FindNode(text('管理').clickable(true))) {
+            if (detectWechatLoggedOut()) {
+                upStepLog(taskId, 'checkWx', '检测到微信账号已退出或需要安全验证', 'error');
+                return 'logged_out';
+            } else if (jc.FindNode(text('管理').clickable(true))) {
                 logd('到达选择账号界面');
                 if (jc.FindNode(text(wxName).clz('android.widget.TextView'))) {
                     logd('点击选择:　' + j_node.text);
@@ -323,7 +334,7 @@ function checkWxName(wxName, taskId) {
                         upStepLog(taskId, 'checkWx', '当前账号:' + nowWxName + ' 目标:' + wxName); // 步骤日志L06
                         if (nowWxName === wxName) {
                             upStepLog(taskId, 'checkWx', '微信账号确认正确'); // 步骤日志L07
-                            return true;
+                            return 'success';
                         } else {
                             if (jc.FindNode(text('设置').id('android:id/title').clz('android.widget.TextView'))) {
                                 logd('点击:　' + j_node.text);
@@ -352,8 +363,12 @@ function checkWxName(wxName, taskId) {
         }
         sleep(1000);
     }
+    if (taskDeadline && time() >= taskDeadline - 20000) {
+        upStepLog(taskId, 'checkWx', '任务总时限即将到达，停止账号验证', 'error');
+        return 'deadline';
+    }
     upStepLog(taskId, 'checkWx', '账号验证超时100s', 'error'); // 步骤日志L08
-    return false;
+    return 'timeout';
 }
 
 /**
@@ -755,6 +770,7 @@ function main() {
                 resultUploaded = false; // 新任务前重置提交标记
                 scanTaskSnapshot = null; // 清除旧任务快照，防止残留的旧结果被误报
                 config.validationFailurePending = false;
+                config.accountCheckRecoveryCount = 0;
                 if (config.updateInProgress) {
                     sleep(1000);
                     break;
@@ -784,11 +800,32 @@ function main() {
                 }
                 break;  //图片转换
             case 3:
-                if (checkWxName(taskConfig.wxName, taskConfig.taskId)) {
+                const accountCheckResult = checkWxName(taskConfig.wxName, taskConfig.taskId, taskConfig.taskDeadline);
+                if (accountCheckResult === 'success') {
                     config.step = 4;
                 } else {
-                    if (!restartWechatSafely('账号验证超时', taskConfig.taskId)) {
-                        upResult(taskConfig, false, '账号验证超时且重启微信失败');
+                    let accountError = '账号验证超时';
+                    if (accountCheckResult === 'logged_out') {
+                        accountError = '微信账号已退出或触发风控，需要人工登录';
+                    } else if (accountCheckResult === 'deadline') {
+                        accountError = '账号验证超过任务总时限';
+                    }
+
+                    const canRecover = accountCheckResult === 'timeout' &&
+                        config.accountCheckRecoveryCount < 1 &&
+                        (!taskConfig.taskDeadline || time() + 30000 < taskConfig.taskDeadline);
+                    if (canRecover) {
+                        config.accountCheckRecoveryCount++;
+                        if (!restartWechatSafely('账号验证超时，执行唯一一次恢复', taskConfig.taskId)) {
+                            accountError = '账号验证超时且重启微信失败';
+                            upResult(taskConfig, false, accountError);
+                            taskConfig = null;
+                            config.step = 1;
+                        }
+                    } else {
+                        upStepLog(taskConfig.taskId, 'checkWx', '账号检查终止: ' + accountError, 'error');
+                        upResult(taskConfig, false, accountError);
+                        taskConfig = null;
                         config.step = 1;
                     }
                 }
