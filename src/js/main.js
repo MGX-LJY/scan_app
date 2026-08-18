@@ -180,7 +180,7 @@ function ackScanTask(taskConfig) {
     return false;
 }
 
-function upResult(taskConfig, result = true, error = null) {
+function upResult(taskConfig, result = true, error = null, errorCode = null) {
     const url = `${config.baseUrl}/api/scan/result`;
     const data = JSON.stringify({
         "task_id": taskConfig.taskId,              // 必填，任务ID
@@ -188,7 +188,8 @@ function upResult(taskConfig, result = true, error = null) {
         "success": result,                    // 必填，扫码是否成功
         "wechat_nickname": taskConfig.wxName, // 选填，扫码成功时的微信昵称
         "scan_time": time(),                    // 必填，扫码时间戳(毫秒)
-        "error": error                       // 选填，失败原因(成功时为null)
+        "error": error,                      // 选填，失败原因(成功时为null)
+        "error_code": errorCode              // 机器可读状态，供服务端阻止重复扫码
     });
     for (let i = 0; i < 5; i++) {
         // 内网穿透延迟/抖动大，超时给到15秒
@@ -823,13 +824,15 @@ function main() {
                         config.accountCheckRecoveryCount++;
                         if (!restartWechatSafely('账号验证超时，执行唯一一次恢复', taskConfig.taskId)) {
                             accountError = '账号验证超时且重启微信失败';
-                            upResult(taskConfig, false, accountError);
+                            upResult(taskConfig, false, accountError, 'account_verification_required');
                             taskConfig = null;
                             config.step = 1;
                         }
                     } else {
                         upStepLog(taskConfig.taskId, 'checkWx', '账号检查终止: ' + accountError, 'error');
-                        upResult(taskConfig, false, accountError);
+                        const accountErrorCode = accountCheckResult === 'logged_out' ?
+                            'account_logged_out' : 'account_verification_required';
+                        upResult(taskConfig, false, accountError, accountErrorCode);
                         taskConfig = null;
                         config.step = 1;
                     }
