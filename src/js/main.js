@@ -289,9 +289,14 @@ function restartWechatSafely(reason, taskId) {
 }
 
 function detectWechatLoggedOut() {
-    const loggedOutText = textMatch('^(登录|手机号登录|微信号/QQ号/邮箱登录|用微信号/QQ号/邮箱登录|重新登录|安全验证)$').pkg(config.pkgName);
-    const riskText = textMatch('.*(帐号已退出|账号已退出|登录已过期|登录环境异常|存在安全风险|被盗风险|限制登录|解除限制).*').pkg(config.pkgName);
-    return jc.FindNode(loggedOutText) || jc.FindNode(riskText);
+    // 只识别微信真正的登录页。首页风控/安全提醒通常可由人工提前处理，
+    // 不能仅凭风险文案把仍处于登录状态的账号误判为退出。
+    if (jc.FindNode(textMatch('^(手机号登录|微信号/QQ号/邮箱登录|用微信号/QQ号/邮箱登录)$').pkg(config.pkgName))) {
+        return true;
+    }
+    const hasLoginButton = jc.FindNode(text('登录').pkg(config.pkgName));
+    const hasRegisterButton = jc.FindNode(text('注册').pkg(config.pkgName));
+    return hasLoginButton && hasRegisterButton;
 }
 
 function checkWxName(wxName, taskId, taskDeadline) {
@@ -304,7 +309,7 @@ function checkWxName(wxName, taskId, taskDeadline) {
     while (time() < checkDeadline) {
         try {
             if (detectWechatLoggedOut()) {
-                upStepLog(taskId, 'checkWx', '检测到微信账号已退出或需要安全验证', 'error');
+                upStepLog(taskId, 'checkWx', '检测到微信登录页面，账号已退出', 'error');
                 return 'logged_out';
             } else if (jc.FindNode(text('管理').clickable(true))) {
                 logd('到达选择账号界面');
@@ -806,7 +811,7 @@ function main() {
                 } else {
                     let accountError = '账号验证超时';
                     if (accountCheckResult === 'logged_out') {
-                        accountError = '微信账号已退出或触发风控，需要人工登录';
+                        accountError = '微信账号已退出，需要人工登录';
                     } else if (accountCheckResult === 'deadline') {
                         accountError = '账号验证超过任务总时限';
                     }
