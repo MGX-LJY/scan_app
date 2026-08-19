@@ -1,89 +1,6 @@
 const SCAN_SERVER_BASE_URL = 'https://scan.mgxnet.com';
 // wechat_actions.js 位于 src/js，会被 EasyClick 编译为同一 IEC 中的 Java 字节码。
 // 官方明确规定 src/js 内文件直接互相引用，不能使用 CommonJS require/export。
-// 通知采集器保持闭包隔离并直接内嵌，避免引入任何 CommonJS 加载链路。
-const inboxCollector = (function () {
-    const packageName = 'com.tencent.mm';
-
-    function valueOfText(value) {
-        return value === null || value === undefined ? '' : ('' + value).trim();
-    }
-
-    function keyOf(item) {
-        return [valueOfText(item.key), valueOfText(item.seqId), valueOfText(item.time),
-            valueOfText(item.title), valueOfText(item.text), valueOfText(item.bigText)].join('|');
-    }
-
-    function messageType(item) {
-        const content = valueOfText(item.bigText) || valueOfText(item.text) || valueOfText(item.subText);
-        if (/^\[图片\]|图片消息/.test(content)) return 'image';
-        if (/^\[语音\]|语音消息/.test(content)) return 'voice';
-        if (/^\[链接\]|网页链接/.test(content)) return 'link';
-        if (/^\[文件\]|文件消息/.test(content)) return 'file';
-        if (!content || /收到一条消息|有新消息/.test(content)) return 'unknown';
-        return 'text';
-    }
-
-    function eventOf(item, options) {
-        const content = valueOfText(item.bigText) || valueOfText(item.text) || valueOfText(item.subText);
-        const sender = valueOfText(item.titleBig) || valueOfText(item.title);
-        return {
-            device_id: options.deviceId,
-            account_id: options.activeAccount ? options.activeAccount() : null,
-            source: 'notification', source_key: keyOf(item), sender: sender,
-            conversation_hint: sender, text_preview: content,
-            message_type: messageType(item),
-            observed_at: Number(item.time) > 0 ? Number(item.time) : time(),
-            confidence: sender && content ? 0.9 : 0.45,
-            payload: {notification_key: valueOfText(item.key),
-                notification_seq_id: valueOfText(item.seqId),
-                sub_text: valueOfText(item.subText), summary: valueOfText(item.summaryBig)}
-        };
-    }
-
-    function start(options) {
-        const state = storages.create('wechat_inbox_collector_v1');
-        thread.execAsync(function () {
-            let permissionLogged = false;
-            while (!options.shouldStop || !options.shouldStop()) {
-                try {
-                    if (!acEvent.hasNotificationPermission()) {
-                        if (!permissionLogged) logw('微信通知监听权限未开启，入站消息采集暂停');
-                        permissionLogged = true;
-                        sleep(15000);
-                        continue;
-                    }
-                    permissionLogged = false;
-                    const notifications = acEvent.getLastNotification(packageName, 20) || [];
-                    const events = [];
-                    for (let i = notifications.length - 1; i >= 0; i--) {
-                        const item = notifications[i];
-                        const key = keyOf(item);
-                        if (!key || state.getBoolean('seen:' + key, false)) continue;
-                        events.push(eventOf(item, options));
-                    }
-                    if (events.length) {
-                        const response = http.postJSON(options.baseUrl + '/api/wechat/v1/events/batch',
-                            JSON.stringify({events: events}), 10000, null);
-                        const parsed = JSON.parse(response);
-                        if (parsed.success) {
-                            for (let i = 0; i < events.length; i++) {
-                                state.putBoolean('seen:' + events[i].source_key, true);
-                            }
-                            logi('微信通知上报完成: ' + events.length + '条');
-                        }
-                    }
-                } catch (error) {
-                    logw('微信通知采集失败: ' + error);
-                }
-                sleep(3000);
-            }
-        });
-    }
-
-    return {start: start};
-})();
-
 function humanizedPointClick(x, y, radius) {
     const spread = Math.max(1, Math.min(10, ~~radius || 4));
     const px = Math.max(1, Math.min(device.getScreenWidth() - 2,
@@ -1571,25 +1488,6 @@ function main() {
         updateStagger
     );
     logi('自动更新已启用，首次检查延迟: ' + updateStagger + '秒');
-
-    try {
-        if (!acEvent.hasNotificationPermission()) {
-            logw('正在请求微信通知监听权限');
-            acEvent.requestNotificationPermission(10);
-        }
-    } catch (notificationPermissionError) {
-        logw('通知监听权限请求失败: ' + notificationPermissionError);
-    }
-    inboxCollector.start({
-        deviceId: config.deviceId,
-        baseUrl: config.baseUrl,
-        activeAccount: function () {
-            return config.verifiedActionAccount || null;
-        },
-        shouldStop: function () { return false; }
-    });
-    logi('微信通知入站采集已启动');
-
 
     let taskConfig = {};
     let scanResult = -999;
