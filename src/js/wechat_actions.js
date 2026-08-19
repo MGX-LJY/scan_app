@@ -2,9 +2,8 @@
 const WX_PACKAGE = 'com.tencent.mm';
 const WX_PAGE = {
     MAIN: 'main', SEARCH: 'search', CHAT_TEXT: 'chat_text', CHAT_VOICE: 'chat_voice',
-    CHAT_EMOJI: 'chat_emoji', CHAT_READONLY: 'chat_readonly', MOMENTS: 'moments', MOMENT_EDITOR: 'moment_editor',
-    CHANNELS: 'channels', SAFETY_REMINDER: 'safety_reminder', BLOCKED: 'blocked',
-    OTHER: 'other', UNKNOWN: 'unknown'
+    CHAT_EMOJI: 'chat_emoji', MOMENTS: 'moments', MOMENT_EDITOR: 'moment_editor',
+    CHANNELS: 'channels', BLOCKED: 'blocked', OTHER: 'other', UNKNOWN: 'unknown'
 };
 const runtime = {
     currentChatContact: null,
@@ -210,10 +209,6 @@ function detectWechatPage() {
         logw('微信页面快照失败: ' + snapshotError);
     }
     function attr(name, value) { return xml.indexOf(name + '="' + value + '"') >= 0; }
-    if (attr('text', '微信安全提醒') &&
-        (attr('text', '详情') || xml.indexOf('当前无法使用所有社交场景') >= 0)) {
-        return WX_PAGE.SAFETY_REMINDER;
-    }
     const blockers = ['登录', '手机号登录', '微信安全中心', '安全验证', '请输入验证码'];
     for (let blockerIndex = 0; blockerIndex < blockers.length; blockerIndex++) {
         if (attr('text', blockers[blockerIndex])) return WX_PAGE.BLOCKED;
@@ -226,10 +221,6 @@ function detectWechatPage() {
     if (attr('desc', '切换到键盘') && (attr('text', '按住 说话') || attr('text', '按住说话'))) return WX_PAGE.CHAT_VOICE;
     if ((attr('desc', '切换到按住说话') || attr('id', 'com.tencent.mm:id/bkk')) &&
         attr('desc', '表情')) return WX_PAGE.CHAT_TEXT;
-    // 账号受限时聊天输入区会被微信移除，但聊天返回键和对方头像仍在。
-    if (attr('id', 'com.tencent.mm:id/actionbar_up_indicator') && xml.indexOf('头像"') >= 0) {
-        return WX_PAGE.CHAT_READONLY;
-    }
     let tabCount = 0;
     const tabs = ['微信', '通讯录', '发现', '我'];
     for (let i = 0; i < tabs.length; i++) {
@@ -239,12 +230,6 @@ function detectWechatPage() {
 }
 
 function clickKnownPageBack(page, deadline) {
-    if (page === WX_PAGE.SAFETY_REMINDER) {
-        back();
-        return waitFor(function () {
-            return detectWechatPage() !== WX_PAGE.SAFETY_REMINDER;
-        }, Math.min(4000, Math.max(1000, (deadline || time() + 4000) - time())), 250);
-    }
     if (page === WX_PAGE.CHAT_EMOJI) {
         if (switchToKeyboardMode(deadline)) return true;
         back();
@@ -269,11 +254,17 @@ function mainTab(tabName, deadline) {
         const page = detectWechatPage();
         if (page === WX_PAGE.BLOCKED || page === WX_PAGE.OTHER) return false;
         if (page === WX_PAGE.MAIN && isMainTabActive(tabName)) return true;
-        const clicked = withNode(function () { return bottomTabNode(tabName); }, clickVerifiedNode);
+        const clicked = retryFreshNode('main_tab_' + tabName, function () {
+            return bottomTabNode(tabName);
+        }, clickVerifiedNode, 3, 450, deadline);
         if (clicked) {
-            return waitFor(function () {
+            const active = waitFor(function () {
                 return detectWechatPage() === WX_PAGE.MAIN && isMainTabActive(tabName);
             }, 5000, 250);
+            if (active) return true;
+            // 点击已发出但节点的 selected 状态刷新慢，重抓节点再试，不立即判失败。
+            humanPause(350, 800);
+            continue;
         }
         // UNKNOWN 页面也先尝试底部主标签；微信页面切换期间节点树可能短暂不完整。
         if (page === WX_PAGE.UNKNOWN || !clickKnownPageBack(page, deadline)) return false;
@@ -1004,9 +995,8 @@ function restoreToWechatHome(options) {
         for (let depth = 0; depth < 6 && time() < deadline; depth++) {
             page = detectWechatPage();
             if (page === WX_PAGE.MAIN) break;
-            if ([WX_PAGE.CHAT_TEXT, WX_PAGE.CHAT_VOICE, WX_PAGE.CHAT_EMOJI, WX_PAGE.CHAT_READONLY,
-                 WX_PAGE.SEARCH, WX_PAGE.MOMENTS, WX_PAGE.CHANNELS,
-                 WX_PAGE.SAFETY_REMINDER].indexOf(page) < 0) break;
+            if ([WX_PAGE.CHAT_TEXT, WX_PAGE.CHAT_VOICE, WX_PAGE.CHAT_EMOJI,
+                 WX_PAGE.SEARCH, WX_PAGE.MOMENTS, WX_PAGE.CHANNELS].indexOf(page) < 0) break;
             const left = clickKnownPageBack(page, deadline);
             trace.push('back_' + page + '_' + left);
             if (!left) break;
