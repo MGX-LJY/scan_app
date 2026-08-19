@@ -298,8 +298,12 @@ function shouldPreemptWechatAction(taskId) {
 
 function savePendingActionResult(task, outcome, phase) {
     try {
+        const persistedTask = JSON.parse(JSON.stringify(task || {}));
+        if (persistedTask.payload && persistedTask.payload.password) {
+            delete persistedTask.payload.password;
+        }
         const record = {
-            task: task,
+            task: persistedTask,
             outcome: outcome || null,
             phase: phase,
             saved_at: time()
@@ -472,7 +476,8 @@ function processWechatAction(task) {
         let accountResult = 'success';
         const deviceOnlyTask = task.action_type === 'device_sleep' || task.action_type === 'device_wake';
         const switchAccountTask = task.action_type === 'switch_account';
-        if (!deviceOnlyTask && !switchAccountTask) {
+        const accountLoginTask = task.action_type === 'account_login';
+        if (!deviceOnlyTask && !switchAccountTask && !accountLoginTask) {
             const targetAccountKey = task.account_id || task.account;
             if (detectWechatLoggedOut()) {
                 accountResult = 'logged_out';
@@ -513,7 +518,9 @@ function processWechatAction(task) {
         queuePhoneAudit(task, 'action_begin_fence_passed', 'running', 'info', {});
         let outcome;
         try {
-            if (switchAccountTask) {
+            if (accountLoginTask) {
+                outcome = executeAccountLogin(task);
+            } else if (switchAccountTask) {
                 const switchResult = checkWxName(
                     task.wechat_name || (task.payload && task.payload.target_wechat_name) || task.account,
                     null, task.hard_deadline || task.deadline
@@ -540,7 +547,8 @@ function processWechatAction(task) {
         } catch (e) {
             outcome = {success: false, error: '动作执行异常: ' + e};
         }
-        const needsWechatHome = task.action_type !== 'device_sleep' && task.action_type !== 'device_wake';
+        const needsWechatHome = task.action_type !== 'device_sleep' &&
+            task.action_type !== 'device_wake' && task.action_type !== 'account_login';
         if (needsWechatHome) {
             const cleanup = wechatActionExecutor.restoreToWechatHome({
                 reason: outcome.preempted === true ? 'preempted' : outcome.success ? 'completed' : 'failed'
@@ -782,6 +790,106 @@ function detectWechatLoggedOut() {
     const confirmed = hasLoginButton && (hasRegisterButton || hasAccountPageCompanion);
     if (confirmed) logw('通过登录按钮组合确认微信登录页');
     return confirmed;
+}
+
+function reportWechatLoginPage() {
+    if (!detectWechatLoggedOut()) return false;
+    let identifier = '';
+    try {
+        if (jc.FindNode(textMatch('^1[0-9]{10}$').pkg(config.pkgName))) {
+            identifier = String(j_node.text || '').trim();
+        }
+        if (!identifier) {
+            loge('检测到登录页，但未识别到11位登录手机号');
+            return false;
+        }
+        const response = http.postJSON(
+            config.baseUrl + '/api/wechat/v1/devices/login-state',
+            JSON.stringify({device_id: config.deviceId, login_identifier: identifier}),
+            10000, null);
+        const result = JSON.parse(response);
+        if (!result.success) return false;
+        logw('已向服务器上报微信退出状态，等待自动登录任务');
+        return true;
+    } catch (error) {
+        loge('上报微信登录页失败: ' + error);
+        return false;
+    } finally {
+        try { releaseNode(); } catch (ignoreLoginPageRelease) {}
+    }
+}
+
+function inputPasswordCharacterByCharacter(editor, password, deadline) {
+    if (!editor || !password) return false;
+    editor.clearText();
+    for (let i = 1; i <= password.length; i++) {
+        if (time() + 1500 >= deadline || config.actionPreemptRequested) return false;
+        if (!editor.inputText(password.substring(0, i))) return false;
+        sleep(random(90, 240));
+    }
+    return true;
+}
+
+function executeAccountLogin(task) {
+    const payload = task.payload || {};
+    const deadline = Math.min(task.hard_deadline || time() + 150000, time() + 150000);
+    const identifier = String(payload.login_identifier || '');
+    const password = String(payload.password || '');
+    if (!detectWechatLoggedOut()) return {success: false, error: '当前不是微信登录页',
+        result: {error_code: 'login_page_not_detected'}};
+    if (!identifier || !jc.FindNode(text(identifier).pkg(config.pkgName))) {
+        return {success: false, error: '登录页账号与任务不一致',
+            result: {error_code: 'login_identifier_mismatch'}};
+    }
+    if (!password) return {success: false, error: '服务器未下发登录凭据',
+        result: {error_code: 'login_secret_missing'}};
+    let editor = null;
+    try {
+        if (!jc.FindNode(id('com.tencent.mm:id/d98').clz('android.widget.EditText').pkg(config.pkgName))) {
+            return {success: false, error: '未找到密码输入框',
+                result: {error_code: 'login_password_field_missing'}};
+        }
+        editor = j_node;
+        humanizedNodeClick(editor);
+        if (!inputPasswordCharacterByCharacter(editor, password, deadline)) {
+            return {success: false, preempted: config.actionPreemptRequested,
+                error: '密码逐字输入失败', result: {error_code: 'login_password_input_failed'}};
+        }
+        sleep(random(400, 900));
+        if (!jc.FindNode(text('登录').id('com.tencent.mm:id/iol').pkg(config.pkgName))) {
+            return {success: false, error: '未找到登录按钮',
+                result: {error_code: 'login_button_missing'}};
+        }
+        humanizedNodeClick(j_node);
+        let nonLoginChecks = 0;
+        while (time() < deadline) {
+            if (config.actionPreemptRequested) return {success: false, preempted: true,
+                error: '扫码任务抢占登录'};
+            if (jc.FindNode(textMatch('^(安全验证|身份验证|短信验证|请完成验证|登录环境异常).*$').pkg(config.pkgName)) ||
+                jc.FindNode(descMatch('^(安全验证|身份验证|短信验证|请完成验证|登录环境异常).*$').pkg(config.pkgName))) {
+                return {success: false, error: '登录需要人工安全验证',
+                    result: {error_code: 'login_security_verification'}};
+            }
+            if (!detectWechatLoggedOut()) {
+                nonLoginChecks++;
+                if (nonLoginChecks >= 3) {
+                    return {success: true, result: {login_state: 'logged_in',
+                        account_id: task.account_id, credential_used: true}};
+                }
+            } else {
+                nonLoginChecks = 0;
+            }
+            if (jc.FindNode(textMatch('^(密码错误|帐号或密码错误|登录失败).*$').pkg(config.pkgName))) {
+                return {success: false, error: '微信拒绝登录凭据',
+                    result: {error_code: 'login_credentials_rejected'}};
+            }
+            sleep(800);
+        }
+        return {success: false, error: '登录等待超时', result: {error_code: 'login_timeout'}};
+    } finally {
+        editor = null;
+        try { releaseNode(); } catch (ignoreLoginRelease) {}
+    }
 }
 
 /**
@@ -1442,7 +1550,12 @@ function main() {
                     sleep(1000);
                     break;
                 }
-                if (config.wechatRecoveryRequired) {
+                const onWechatLoginPage = detectWechatLoggedOut();
+                if (onWechatLoginPage) {
+                    reportWechatLoginPage();
+                    config.wechatRecoveryRequired = false;
+                }
+                if (config.wechatRecoveryRequired && !onWechatLoginPage) {
                     let recoveredHome = wechatActionExecutor.restoreToWechatHome({reason: 'recovery_gate'});
                     config.wechatRecoveryAttempts++;
                     if (!recoveredHome.success && config.wechatRecoveryAttempts >= 2) {

@@ -883,6 +883,32 @@ function cancelMomentDraft() {
     return !momentEditorVisible();
 }
 
+function browseMoments(payload, deadline, shouldPreempt) {
+    if (!openDiscoverItem('朋友圈', deadline)) return {success: false, error: '无法进入朋友圈'};
+    const requested = intOrDefault(payload.duration_seconds, 180);
+    const duration = Math.max(30, Math.min(requested, 900));
+    const endAt = Math.min(deadline || time() + duration * 1000, time() + duration * 1000);
+    let swipes = 0;
+    let reason = 'duration_complete';
+    while (time() < endAt) {
+        if (shouldPreempt && shouldPreempt()) { reason = 'scan_preempted'; break; }
+        const waitMs = Math.min(random(3500, 11000), Math.max(0, endAt - time()));
+        if (waitMs > 0) sleep(waitMs);
+        if (time() >= endAt) break;
+        swipeToPoint(device.getScreenWidth() * random(42, 59) / 100,
+            device.getScreenHeight() * random(70, 83) / 100,
+            device.getScreenWidth() * random(40, 61) / 100,
+            device.getScreenHeight() * random(23, 39) / 100, random(650, 1250));
+        swipes++;
+        // 只做浏览和滚动，不点击赞、评论、头像、链接或发布入口。
+        if (random(0, 5) === 0) sleep(random(1200, 4200));
+    }
+    return {success: reason === 'duration_complete', preempted: reason === 'scan_preempted',
+        result: {duration_seconds: Math.round((duration * 1000 - Math.max(0, endAt - time())) / 1000),
+            swipes: swipes, interaction_mode: 'read_only', end_reason: reason},
+        error: reason === 'scan_preempted' ? '扫码任务抢占' : null};
+}
+
 function postMoment(payload, deadline, shouldPreempt) {
     if (!openDiscoverItem('朋友圈', deadline)) return {success: false, error: '无法进入朋友圈'};
     sleep(1000);
@@ -1016,6 +1042,7 @@ function execute(task, shouldPreempt) {
     if (task.action_type === 'call_answer') return answerIncomingCall(task.payload || {}, shouldPreempt, actionDeadline);
     if (task.action_type === 'call_hangup') return hangupCurrentCall();
     if (task.action_type === 'channels_browse') return browseChannels(task.payload || {}, shouldPreempt, actionDeadline);
+    if (task.action_type === 'moment_browse') return browseMoments(task.payload || {}, actionDeadline, shouldPreempt);
     if (task.action_type === 'moment_text') return postMoment(task.payload || {}, actionDeadline, shouldPreempt);
     if (task.action_type === 'device_sleep') {
         home();
