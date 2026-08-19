@@ -466,6 +466,16 @@ function processWechatAction(task) {
             if (existing.task && existing.task.task_id === task.task_id) return true;
         }
         if (!ackWechatActionTask(task)) return false;
+        const deviceOnlyTask = task.action_type === 'device_sleep' || task.action_type === 'device_wake';
+        const accountLoginTask = task.action_type === 'account_login';
+        const switchAccountTask = task.action_type === 'switch_account';
+        // 覆盖聊天、朋友圈、视频号、通话、切号等所有依赖微信登录态的任务。
+        // begin 前发现退出时，原任务没有产生外部副作用，可以安全退回队列。
+        if (!deviceOnlyTask && !accountLoginTask && detectWechatLoggedOut()) {
+            if (deferWechatTaskForLogin(task)) return true;
+            loge('检测到微信退出，但原任务未能安全暂停，禁止继续执行');
+            return false;
+        }
         if (!savePendingActionResult(task, null, 'executing')) {
             // 此时尚未执行任何外部动作，可以安全上报失败。
             reportWechatAction(task, {success: false, error: 'action_checkpoint_write_failed'});
@@ -474,9 +484,6 @@ function processWechatAction(task) {
         startWechatActionHeartbeat(task);
         // 设备睡眠/唤醒不依赖微信账号，避免在设备级任务前误触账号切换。
         let accountResult = 'success';
-        const deviceOnlyTask = task.action_type === 'device_sleep' || task.action_type === 'device_wake';
-        const switchAccountTask = task.action_type === 'switch_account';
-        const accountLoginTask = task.action_type === 'account_login';
         if (!deviceOnlyTask && !switchAccountTask && !accountLoginTask) {
             const targetAccountKey = task.account_id || task.account;
             if (detectWechatLoggedOut()) {
@@ -582,6 +589,11 @@ function processWechatAction(task) {
             }
         }
         if (outcome.success) {
+            if (accountLoginTask) {
+                config.verifiedActionAccount = task.account_id;
+                config.verifiedActionAccountAt = time();
+                wechatActionStorage.putString('active_account_id', task.account_id);
+            }
             logi('微信动作完成: ' + task.task_id + ' / ' + task.action_type);
         } else {
             loge('微信动作失败: ' + task.task_id + ' / ' + task.action_type + ' / ' +
@@ -809,6 +821,10 @@ function reportWechatLoginPage() {
             10000, null);
         const result = JSON.parse(response);
         if (!result.success) return false;
+        if (result.requires_manual === true) {
+            loge('账号自动登录已停止，需要人工完成微信安全验证');
+            return false;
+        }
         logw('已向服务器上报微信退出状态，等待自动登录任务');
         return true;
     } catch (error) {
@@ -816,6 +832,38 @@ function reportWechatLoginPage() {
         return false;
     } finally {
         try { releaseNode(); } catch (ignoreLoginPageRelease) {}
+    }
+}
+
+function identifyLoginPageAccount() {
+    if (!detectWechatLoggedOut()) return null;
+    try {
+        if (jc.FindNode(textMatch('^1[0-9]{10}$').pkg(config.pkgName))) {
+            return String(j_node.text || '').trim() || null;
+        }
+    } finally {
+        try { releaseNode(); } catch (ignoreIdentifierRelease) {}
+    }
+    return null;
+}
+
+function deferWechatTaskForLogin(task) {
+    const identifier = identifyLoginPageAccount();
+    if (!identifier) return false;
+    try {
+        const response = http.postJSON(
+            config.baseUrl + '/api/wechat/v1/tasks/' + task.task_id + '/defer-for-login',
+            JSON.stringify({device_id: config.deviceId,
+                dispatch_token: task.dispatch_token, login_identifier: identifier}),
+            10000, null);
+        const result = JSON.parse(response);
+        if (!result.success) return false;
+        logw('原任务已安全暂停，优先执行自动登录: ' + task.task_id);
+        queuePhoneAudit(task, 'task_deferred_for_login', 'pending', 'warning', {});
+        return true;
+    } catch (error) {
+        loge('暂停任务等待自动登录失败: ' + error);
+        return false;
     }
 }
 
@@ -980,6 +1028,7 @@ function checkWxName(wxName, taskId, taskDeadline) {
         }
         try {
             if (detectWechatLoggedOut()) {
+                reportWechatLoginPage();
                 upStepLog(taskId, 'checkWx', '检测到微信登录页面，账号已退出', 'error');
                 return 'logged_out';
             } else if (jc.FindNode(text('管理').clickable(true))) {
@@ -1116,6 +1165,10 @@ function reportObservedWechatAccount(nickname, reason, expectedAccountId) {
 
 function synchronizeObservedWechatAccount(reason, expectedAccountId) {
     const observed = observeCurrentWechatNickname(time() + 30000);
+    if (observed.state === 'logged_out') {
+        reportWechatLoginPage();
+        return false;
+    }
     const matched = reportObservedWechatAccount(
         observed.nickname, reason || 'startup', expectedAccountId || null
     );
