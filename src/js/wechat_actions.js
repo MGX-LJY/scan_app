@@ -1057,5 +1057,9 @@ function execute(task, shouldPreempt) {
     return {success: false, error: '不支持的动作类型: ' + task.action_type};
 }
 
-module.exports = {execute: execute, clickVerifiedNode: clickVerifiedNode,
-    restoreToWechatHome: restoreToWechatHome};
+// EasyClick 会先把 src/js 下每个文件作为独立脚本加载，此时没有 CommonJS module；
+// main.js 随后通过 require 加载本文件时才会提供 module。两种上下文都必须兼容。
+if (typeof module !== 'undefined' && module) {
+    module.exports = {execute: execute, clickVerifiedNode: clickVerifiedNode,
+        restoreToWechatHome: restoreToWechatHome};
+}
