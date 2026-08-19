@@ -51,6 +51,8 @@ let config = {
     baseUrl: SCAN_SERVER_BASE_URL, // 固定公网主地址，不再读取手机端遗留配置
     wxArr: [],
     step:0,
+    scriptSessionId: 'ec-' + time() + '-' + random(100000, 1000000),
+    stepZeroReason: 'script_start',
     pauseResultWatcher: false, // 主线程操作系统设置时暂停后台节点查询，避免节点缓存竞态
     updateInProgress: false,  // 热更新检查/下载期间暂停领取新任务
     pollingTask: false,       // 正在请求扫码任务，防止更新与任务分配竞态
@@ -178,7 +180,9 @@ function login(deviceId, wxArr) {
     const data = JSON.stringify({
         "phone_id": deviceId,           // 必填，手机唯一ID
         "wechat_accounts": wxArr,  // 必填，微信号列表arr类型
-        "app_version": config.version
+        "app_version": config.version,
+        "script_session_id": config.scriptSessionId,
+        "step_zero_reason": config.stepZeroReason
     });
     for (let i = 0; i < 10; i++) {
         // 内网穿透延迟/抖动大，超时给到15秒
@@ -1587,6 +1591,7 @@ function main() {
         switch ( config.step) {
             case 0:
                 logi('开始注册，当前版本号: ' + config.version);
+                logi('脚本会话: ' + config.scriptSessionId + ' 进入注册原因: ' + config.stepZeroReason);
                 if (login(config.deviceId, config.wxArr)) {
                     if (!synchronizeObservedWechatAccount('script_startup', null)) {
                         logw('启动时未能匹配当前微信，扫码和社交动作将等待显式切号任务');
