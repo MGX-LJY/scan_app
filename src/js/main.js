@@ -1179,7 +1179,25 @@ function synchronizeObservedWechatAccount(reason, expectedAccountId) {
     const matched = reportObservedWechatAccount(
         observed.nickname, reason || 'startup', expectedAccountId || null
     );
-    try { wechatActionExecutor.restoreToWechatHome({reason: 'account_observation'}); } catch (ignore) {}
+    let cleanup = {success: false, error: '账号观测后首页恢复未执行'};
+    try {
+        cleanup = wechatActionExecutor.restoreToWechatHome({reason: 'account_observation'});
+        if (!cleanup.success) {
+            sleep(random(800, 1601));
+            cleanup = wechatActionExecutor.restoreToWechatHome({reason: 'account_observation_retry'});
+        }
+    } catch (cleanupError) {
+        cleanup = {success: false, error: '' + cleanupError};
+    }
+    config.wechatRecoveryRequired = cleanup.success !== true;
+    config.wechatRecoveryAttempts = cleanup.success ? 0 : config.wechatRecoveryAttempts + 1;
+    if (config.wechatRecoveryRequired) {
+        wechatActionStorage.putString('recovery_required', 'true');
+        loge('读取微信昵称后未恢复到首页，已进入恢复门禁: ' + JSON.stringify(cleanup));
+    } else {
+        wechatActionStorage.remove('recovery_required');
+        logi('读取微信昵称后已恢复到微信首页');
+    }
     return matched;
 }
 
