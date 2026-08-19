@@ -1,6 +1,88 @@
 const SCAN_SERVER_BASE_URL = 'https://scan.mgxnet.com';
 const wechatActionExecutor = require('wechat_actions.js');
-const inboxCollector = require('inbox_collector.js');
+// EasyClick/Rhino 的 CommonJS 加载器连续 require 第二个本地模块时，部分设备不会
+// 注入 module 对象。通知采集器保持闭包隔离并直接内嵌，避免启动阶段 ReferenceError。
+const inboxCollector = (function () {
+    const packageName = 'com.tencent.mm';
+
+    function valueOfText(value) {
+        return value === null || value === undefined ? '' : ('' + value).trim();
+    }
+
+    function keyOf(item) {
+        return [valueOfText(item.key), valueOfText(item.seqId), valueOfText(item.time),
+            valueOfText(item.title), valueOfText(item.text), valueOfText(item.bigText)].join('|');
+    }
+
+    function messageType(item) {
+        const content = valueOfText(item.bigText) || valueOfText(item.text) || valueOfText(item.subText);
+        if (/^\[图片\]|图片消息/.test(content)) return 'image';
+        if (/^\[语音\]|语音消息/.test(content)) return 'voice';
+        if (/^\[链接\]|网页链接/.test(content)) return 'link';
+        if (/^\[文件\]|文件消息/.test(content)) return 'file';
+        if (!content || /收到一条消息|有新消息/.test(content)) return 'unknown';
+        return 'text';
+    }
+
+    function eventOf(item, options) {
+        const content = valueOfText(item.bigText) || valueOfText(item.text) || valueOfText(item.subText);
+        const sender = valueOfText(item.titleBig) || valueOfText(item.title);
+        return {
+            device_id: options.deviceId,
+            account_id: options.activeAccount ? options.activeAccount() : null,
+            source: 'notification', source_key: keyOf(item), sender: sender,
+            conversation_hint: sender, text_preview: content,
+            message_type: messageType(item),
+            observed_at: Number(item.time) > 0 ? Number(item.time) : time(),
+            confidence: sender && content ? 0.9 : 0.45,
+            payload: {notification_key: valueOfText(item.key),
+                notification_seq_id: valueOfText(item.seqId),
+                sub_text: valueOfText(item.subText), summary: valueOfText(item.summaryBig)}
+        };
+    }
+
+    function start(options) {
+        const state = storages.create('wechat_inbox_collector_v1');
+        thread.execAsync(function () {
+            let permissionLogged = false;
+            while (!options.shouldStop || !options.shouldStop()) {
+                try {
+                    if (!acEvent.hasNotificationPermission()) {
+                        if (!permissionLogged) logw('微信通知监听权限未开启，入站消息采集暂停');
+                        permissionLogged = true;
+                        sleep(15000);
+                        continue;
+                    }
+                    permissionLogged = false;
+                    const notifications = acEvent.getLastNotification(packageName, 20) || [];
+                    const events = [];
+                    for (let i = notifications.length - 1; i >= 0; i--) {
+                        const item = notifications[i];
+                        const key = keyOf(item);
+                        if (!key || state.getBoolean('seen:' + key, false)) continue;
+                        events.push(eventOf(item, options));
+                    }
+                    if (events.length) {
+                        const response = http.postJSON(options.baseUrl + '/api/wechat/v1/events/batch',
+                            JSON.stringify({events: events}), 10000, null);
+                        const parsed = JSON.parse(response);
+                        if (parsed.success) {
+                            for (let i = 0; i < events.length; i++) {
+                                state.putBoolean('seen:' + events[i].source_key, true);
+                            }
+                            logi('微信通知上报完成: ' + events.length + '条');
+                        }
+                    }
+                } catch (error) {
+                    logw('微信通知采集失败: ' + error);
+                }
+                sleep(3000);
+            }
+        });
+    }
+
+    return {start: start};
+})();
 
 function humanizedPointClick(x, y, radius) {
     const spread = Math.max(1, Math.min(10, ~~radius || 4));
