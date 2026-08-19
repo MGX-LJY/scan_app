@@ -69,6 +69,44 @@ let config = {
 };
 
 const wechatActionStorage = storages.create('wechat_action_runtime_v1');
+
+function taskTraceId(task) {
+    return task && (task.conversation_id || task.event_id || task.task_id) || null;
+}
+
+function queuePhoneAudit(task, eventType, phase, severity, detail) {
+    try {
+        let queue = JSON.parse(wechatActionStorage.getString('audit_queue', '[]'));
+        if (!(queue instanceof Array)) queue = [];
+        queue.push({trace_id: taskTraceId(task), task_id: task && task.task_id || null,
+            event_id: task && task.event_id || null,
+            conversation_id: task && task.conversation_id || null,
+            account_id: task && task.account_id || null, event_type: eventType,
+            phase: phase || null, severity: severity || 'info', detail: detail || {},
+            phone_timestamp: time()});
+        if (queue.length > 200) queue = queue.slice(queue.length - 200);
+        wechatActionStorage.putString('audit_queue', JSON.stringify(queue));
+    } catch (e) { logw('缓存手机审计日志失败: ' + e); }
+}
+
+function flushPhoneAuditLogs() {
+    try {
+        let queue = JSON.parse(wechatActionStorage.getString('audit_queue', '[]'));
+        if (!(queue instanceof Array) || !queue.length) return true;
+        const batch = queue.slice(0, 50);
+        const response = JSON.parse(http.postJSON(
+            `${config.baseUrl}/api/wechat/v1/devices/logs`,
+            JSON.stringify({device_id: config.deviceId, events: batch}), 8000, null));
+        if (!response.success || response.accepted !== batch.length) return false;
+        queue = queue.slice(batch.length);
+        if (queue.length) wechatActionStorage.putString('audit_queue', JSON.stringify(queue));
+        else wechatActionStorage.remove('audit_queue');
+        return true;
+    } catch (e) {
+        logw('上报手机审计日志失败，保留等待补报: ' + e);
+        return false;
+    }
+}
 try {
     config.verifiedActionAccount = wechatActionStorage.getString('active_account_id', '') || null;
     config.wechatRecoveryRequired = wechatActionStorage.getString('recovery_required', '') === 'true';
@@ -220,6 +258,8 @@ function getWechatActionTask() {
             // account_id 是服务器稳定编号；wechat_name 是手机微信界面真实昵称。
             unifiedTask.account = unifiedTask.wechat_name || unifiedTask.account_id;
             unifiedTask.deadline = unifiedTask.soft_deadline;
+            queuePhoneAudit(unifiedTask, 'task_claimed_on_phone', 'claimed', 'info',
+                {action_type: unifiedTask.action_type});
             return unifiedTask;
         }
     } catch (e) {
@@ -241,6 +281,7 @@ function ackWechatActionTask(task) {
         if (ret.success) {
             task.deadline = ret.task ? ret.task.soft_deadline : task.deadline;
             if (ret.task && ret.task.hard_deadline) task.hard_deadline = ret.task.hard_deadline;
+            queuePhoneAudit(task, 'task_acknowledged_on_phone', 'assigned', 'info', {});
         }
         return ret.success === true;
     } catch (e) {
@@ -412,6 +453,9 @@ function processWechatAction(task) {
     config.actionInProgress = true;
     config.pauseResultWatcher = true;
     try {
+        const actionStartedAt = time();
+        queuePhoneAudit(task, 'action_processing_started', 'processing', 'info',
+            {action_type: task.action_type});
         const existing = loadPendingActionResult();
         if (existing) {
             if (!flushPendingActionResult()) return false;
@@ -466,6 +510,7 @@ function processWechatAction(task) {
             flushPendingActionResult();
             return false;
         }
+        queuePhoneAudit(task, 'action_begin_fence_passed', 'running', 'info', {});
         let outcome;
         try {
             if (switchAccountTask) {
@@ -502,6 +547,8 @@ function processWechatAction(task) {
             });
             outcome.result = outcome.result || {};
             outcome.result.cleanup = cleanup;
+            queuePhoneAudit(task, 'action_cleanup_finished', 'cleanup',
+                cleanup.success === true ? 'info' : 'error', cleanup);
             config.wechatRecoveryRequired = cleanup.success !== true;
             config.wechatRecoveryAttempts = cleanup.success ? 0 : config.wechatRecoveryAttempts + 1;
             if (config.wechatRecoveryRequired) {
@@ -536,6 +583,11 @@ function processWechatAction(task) {
             outcome.result = outcome.result || {};
             outcome.result.checkpoint_save_failed = true;
         }
+        queuePhoneAudit(task, 'action_execution_finished', 'result_pending',
+            outcome.success === true ? 'info' : outcome.preempted === true ? 'warning' : 'error',
+            {success: outcome.success === true, preempted: outcome.preempted === true,
+                error: outcome.error || null, elapsed_ms: time() - actionStartedAt,
+                result: outcome.result || {}});
         if (!savePendingActionResult(task, outcome, 'result_pending')) {
             loge('动作已经结束但结果检查点写入失败，停止继续领取任务以防重复执行');
             return false;
@@ -1415,6 +1467,7 @@ function main() {
                     sleep(3000);
                     break;
                 }
+                flushPhoneAuditLogs();
                 taskConfig = getScan(config.deviceId);
                 if (!taskConfig) {
                     // 扫码永远优先；确认当前没有扫码任务后才领取低优先级微信动作。
