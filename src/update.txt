@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":157,
+"version":158,
 "dialog":false,
-"msg": "修复读取微信昵称后偶发未返回微信首页",
+"msg": "增加脚本会话标识并记录手机重复注册原因",
 "force": true,
-"md5":"dcf764087cab7bff34843ea6298d991a",
+"md5":"00c027bec1efd31637b6da935814b553",
 "download_timeout":300
 }
