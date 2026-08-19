@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":154,
+"version":156,
 "dialog":false,
-"msg": "按EasyClick官方规则移除JS目录CommonJS加载并修复启动崩溃",
+"msg": "修复空恢复记录阻塞轮询并移除微信通知监听权限",
 "force": true,
-"md5":"cc8db0c43b762be7904d9ef1d36b2382",
+"md5":"988fa9d0d99d1020db30f3df3528bb3d",
 "download_timeout":300
 }
