@@ -454,8 +454,8 @@ function processWechatAction(task) {
             return false;
         }
         if (config.actionPreemptRequested) {
-            const preemptOutcome = {success: false, preempted: true, error: '扫码任务抢占'};
-            if (!savePendingActionResult(task, preemptOutcome, 'result_pending')) return false;
+            const latePreemptOutcome = {success: false, preempted: true, error: '扫码任务抢占'};
+            if (!savePendingActionResult(task, latePreemptOutcome, 'result_pending')) return false;
             flushPendingActionResult();
             return false;
         }
