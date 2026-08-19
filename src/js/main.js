@@ -1,7 +1,7 @@
 const SCAN_SERVER_BASE_URL = 'https://scan.mgxnet.com';
-const wechatActionExecutor = require('wechat_actions.js');
-// EasyClick/Rhino 的 CommonJS 加载器连续 require 第二个本地模块时，部分设备不会
-// 注入 module 对象。通知采集器保持闭包隔离并直接内嵌，避免启动阶段 ReferenceError。
+// wechat_actions.js 位于 src/js，会被 EasyClick 编译为同一 IEC 中的 Java 字节码。
+// 官方明确规定 src/js 内文件直接互相引用，不能使用 CommonJS require/export。
+// 通知采集器保持闭包隔离并直接内嵌，避免引入任何 CommonJS 加载链路。
 const inboxCollector = (function () {
     const packageName = 'com.tencent.mm';
 

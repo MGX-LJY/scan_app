@@ -1057,9 +1057,11 @@ function execute(task, shouldPreempt) {
     return {success: false, error: '不支持的动作类型: ' + task.action_type};
 }
 
-// EasyClick 会先把 src/js 下每个文件作为独立脚本加载，此时没有 CommonJS module；
-// main.js 随后通过 require 加载本文件时才会提供 module。两种上下文都必须兼容。
-if (typeof module !== 'undefined' && module) {
-    module.exports = {execute: execute, clickVerifiedNode: clickVerifiedNode,
-        restoreToWechatHome: restoreToWechatHome};
-}
+// src/js 下的文件由 EasyClick 一起编译，main.js 可直接访问这个全局对象。
+// 不要在 src/js 内使用 require/module.exports，否则 DEX 运行时会把它当作
+// CommonJS 资源查找并报 Module not found。
+var wechatActionExecutor = {
+    execute: execute,
+    clickVerifiedNode: clickVerifiedNode,
+    restoreToWechatHome: restoreToWechatHome
+};
