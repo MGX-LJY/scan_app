@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":153,
+"version":154,
 "dialog":false,
-"msg": "修复微信动作模块在EasyClick独立加载时的启动崩溃",
+"msg": "按EasyClick官方规则移除JS目录CommonJS加载并修复启动崩溃",
 "force": true,
-"md5":"e707d80fcfe7d7874689e008a5b1fd95",
+"md5":"cc8db0c43b762be7904d9ef1d36b2382",
 "download_timeout":300
 }
