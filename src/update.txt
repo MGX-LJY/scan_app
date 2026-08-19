@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":147,
+"version":150,
 "dialog":false,
-"msg": "修复微信账号退出循环并同步异常状态停止重复扫码",
+"msg": "增加全场景退出自动登录、登录后恢复原任务和轻量朋友圈浏览",
 "force": true,
-"md5":"83b1f7a47c814a4fcd8e1f19629be2d6",
+"md5":"02d6174145f5a38b65bd9fae30601fb1",
 "download_timeout":300
 }
