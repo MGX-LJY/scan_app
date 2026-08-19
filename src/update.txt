@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":152,
+"version":153,
 "dialog":false,
-"msg": "彻底移除旧通知模块文件并修复EasyClick启动崩溃",
+"msg": "修复微信动作模块在EasyClick独立加载时的启动崩溃",
 "force": true,
-"md5":"664ab5a218672d1604ae87442b8125ba",
+"md5":"e707d80fcfe7d7874689e008a5b1fd95",
 "download_timeout":300
 }
