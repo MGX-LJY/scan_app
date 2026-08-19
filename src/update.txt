@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":151,
+"version":152,
 "dialog":false,
-"msg": "紧急修复通知采集模块导致的启动崩溃",
+"msg": "彻底移除旧通知模块文件并修复EasyClick启动崩溃",
 "force": true,
-"md5":"b588ad2fdcee382a67d77f84211ccc52",
+"md5":"664ab5a218672d1604ae87442b8125ba",
 "download_timeout":300
 }
