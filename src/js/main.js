@@ -405,8 +405,16 @@ function savePendingActionResult(task, outcome, phase) {
 
 function loadPendingActionResult() {
     try {
-        const raw = wechatActionStorage.getString('pending_result', '');
-        return raw ? JSON.parse(raw) : null;
+        const stored = wechatActionStorage.getString('pending_result', '');
+        // EasyClick Storage 可能返回 Java String；空 Java String 在 Rhino 条件判断中
+        // 仍可能为真，直接 JSON.parse 会抛出 "Empty JSON string" 并永久阻塞轮询。
+        if (stored === null || stored === undefined) return null;
+        const raw = String(stored).trim();
+        if (!raw || raw === 'null' || raw === 'undefined') {
+            wechatActionStorage.remove('pending_result');
+            return null;
+        }
+        return JSON.parse(raw);
     } catch (e) {
         loge('读取微信动作恢复记录失败: ' + e);
         // 损坏记录不能自动删除，否则脚本可能重复执行一次已经对外发生的动作。
