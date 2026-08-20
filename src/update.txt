@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":158,
+"version":159,
 "dialog":false,
-"msg": "增加脚本会话标识并记录手机重复注册原因",
+"msg": "修复统一任务领取确认并完善扫码手机号两阶段授权",
 "force": true,
-"md5":"00c027bec1efd31637b6da935814b553",
+"md5":"a44037fdd93d84766494b561578b611e",
 "download_timeout":300
 }
