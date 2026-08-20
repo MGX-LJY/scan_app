@@ -72,8 +72,8 @@
 	"tesseractOcrModel":"否",
 	"tsAutoCompile":"是",
 	"verify_apk":"不验证",
-	"version_code":162,
-	"version_name":"1.62",
+	"version_code":163,
+	"version_name":"1.63",
 	"wallModule":"是",
 	"yolov8BoxModel":"否"
 }

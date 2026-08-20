@@ -848,6 +848,20 @@ function clickCurrentChannelLike() {
     }, 1800, 200);
 }
 
+function chooseChannelDwellMs(minSeconds, maxSeconds) {
+    // EasyClick 的全局 random() 在部分真机/DEX 组合上处理五位数毫秒区间时会
+    // 返回非数值，Math.min() 随后得到 NaN，导致停留循环被直接跳过。只在
+    // 小范围“秒”上取随机数，再显式校验并换算成毫秒，任何异常都回退到下限。
+    const minimum = Math.max(1, ~~minSeconds);
+    const maximum = Math.max(minimum, ~~maxSeconds);
+    let picked = Number(random(minimum, maximum));
+    if (!(picked >= minimum && picked <= maximum)) {
+        picked = minimum + Math.floor(Math.random() * (maximum - minimum + 1));
+    }
+    if (!(picked >= minimum && picked <= maximum)) picked = minimum;
+    return picked * 1000;
+}
+
 function browseChannels(payload, shouldPreempt, taskDeadline) {
     const startedAt = time();
     if (!openDiscoverItem('视频号', taskDeadline)) return {success: false, error: '无法进入视频号'};
@@ -872,15 +886,32 @@ function browseChannels(payload, shouldPreempt, taskDeadline) {
     const deadline = Math.min(time() + duration * 1000, (taskDeadline || time() + duration * 1000) - 2000);
     let swipes = 0;
     let likes = 0;
+    let completedDwells = 0;
+    let totalDwellMs = 0;
+    let shortestDwellMs = null;
     let reason = 'duration_complete';
     while (time() < deadline && swipes < maxSwipes) {
-        const waitUntil = Math.min(deadline, time() + random(dwellMin * 1000, dwellMax * 1000));
+        const dwellStartedAt = time();
+        const plannedDwellMs = Math.min(deadline - dwellStartedAt,
+            chooseChannelDwellMs(dwellMin, dwellMax));
+        const waitUntil = dwellStartedAt + plannedDwellMs;
         while (time() < waitUntil) {
             if (hasSafetyBlocker()) { reason = 'account_attention_required'; break; }
             if (shouldPreempt && shouldPreempt()) { reason = 'scan_preempted'; break; }
             sleep(Math.min(1000, waitUntil - time()));
         }
         if (reason !== 'duration_complete') break;
+        const actualDwellMs = time() - dwellStartedAt;
+        // 除任务自然到时外，实际停留不允许明显短于本轮计划。这个守卫可防止
+        // 以后框架计时/休眠异常再次退化成每秒连续滑动却被上报为成功。
+        if (time() < deadline && actualDwellMs + 500 < plannedDwellMs) {
+            reason = 'dwell_timing_invalid';
+            break;
+        }
+        completedDwells++;
+        totalDwellMs += actualDwellMs;
+        shortestDwellMs = shortestDwellMs === null ? actualDwellMs :
+            Math.min(shortestDwellMs, actualDwellMs);
         if (likes < likeBudget && random(1, 101) <= likeProbability) {
             if (shouldPreempt && shouldPreempt()) { reason = 'scan_preempted'; break; }
             if (isChannelsPage() && clickCurrentChannelLike()) {
@@ -896,14 +927,22 @@ function browseChannels(payload, shouldPreempt, taskDeadline) {
         swipes++;
         if (!waitFor(isChannelsPage, 2500, 250)) { reason = 'page_changed_after_swipe'; break; }
     }
-    if (swipes >= maxSwipes && time() < deadline && reason === 'duration_complete') reason = 'swipe_limit';
+    if (swipes >= maxSwipes && time() < deadline && reason === 'duration_complete') {
+        // 调用方显式给出的上限属于正常的有界测试；按时长推导出的上限提前
+        // 耗尽则代表停留节奏失效，必须失败，不能再伪装成“已完成”。
+        reason = explicitSwipeLimit ? 'swipe_limit' : 'swipe_limit_before_duration';
+    }
     if (isWechatForeground() && detectWechatPage() === WX_PAGE.CHANNELS) {
         clickKnownPageBack(WX_PAGE.CHANNELS, taskDeadline);
     }
-    const success = reason === 'duration_complete' || reason === 'swipe_limit';
+    const success = reason === 'duration_complete' ||
+        (explicitSwipeLimit && reason === 'swipe_limit');
     return {success: success, preempted: reason === 'scan_preempted',
         result: {swipes: swipes, likes: likes,
             elapsed_seconds: ~~((time() - startedAt) / 1000), end_reason: reason,
+            planned_duration_seconds: duration, dwell_min_seconds: dwellMin,
+            dwell_max_seconds: dwellMax, completed_dwells: completedDwells,
+            total_dwell_ms: totalDwellMs, shortest_dwell_ms: shortestDwellMs,
             max_swipes: maxSwipes, swipe_limit_source: explicitSwipeLimit ? 'payload' : 'duration'},
         error: success ? null : reason === 'scan_preempted' ? '扫码任务抢占' : '视频号浏览中断: ' + reason};
 }

@@ -1,19 +1,20 @@
 const SCAN_SERVER_BASE_URL = 'https://scan.mgxnet.com';
 // wechat_actions.js 位于 src/js，会被 EasyClick 编译为同一 IEC 中的 Java 字节码。
 // 官方明确规定 src/js 内文件直接互相引用，不能使用 CommonJS require/export。
-function humanizedPointClick(x, y, radius) {
+function humanizedPointClick(x, y, radius, shouldAbort) {
     const spread = Math.max(1, Math.min(10, ~~radius || 4));
     const px = Math.max(1, Math.min(device.getScreenWidth() - 2,
         ~~x + random(-spread, spread + 1)));
     const py = Math.max(1, Math.min(device.getScreenHeight() - 2,
         ~~y + random(-spread, spread + 1)));
     sleep(random(120, 480));
+    if (shouldAbort && shouldAbort()) return false;
     const clicked = clickPoint(px, py);
     sleep(random(90, 350));
     return clicked;
 }
 
-function humanizedNodeClick(node) {
+function humanizedNodeClick(node, shouldAbort) {
     if (!node || !node.visible) return false;
     let current = node;
     for (let depth = 0; current && depth < 7; depth++) {
@@ -28,7 +29,7 @@ function humanizedNodeClick(node) {
                 const insetX = Math.max(2, ~~((right - left) * 0.24));
                 const insetY = Math.max(2, ~~((bottom - top) * 0.24));
                 return humanizedPointClick(random(left + insetX, right - insetX),
-                    random(top + insetY, bottom - insetY), 2);
+                    random(top + insetY, bottom - insetY), 2, shouldAbort);
             }
         }
         current = current.parent();
@@ -37,11 +38,24 @@ function humanizedNodeClick(node) {
 }
 
 function clickNativePhoneAuthorizationCard() {
+    if (config.scanTerminalDetected === true) {
+        return {confirmed: false, submitted: false, terminal: true, method: 'terminal'};
+    }
+    let sheetTitleConfirmed = false;
+    if (jc.FindNode(text('申请获取并验证你的手机号'))) {
+        sheetTitleConfirmed = !!(j_node && j_node.visible);
+    }
     // 部分微信版本会暴露手机号或“上次提供”节点；手机号卡片本身就是
     // 最终授权动作，不存在后续“允许/确认”按钮。
     if (jc.FindNode(textMatch(
             '^(\\d{3}\\*+\\d{4}|微信绑定号码|上次提供|使用微信绑定手机号)$'))) {
-        if (humanizedNodeClick(j_node) === true) return true;
+        if (config.scanTerminalDetected === true) {
+            return {confirmed: true, submitted: false, terminal: true, method: 'node'};
+        }
+        return {confirmed: true, submitted: humanizedNodeClick(j_node, function () {
+                return config.scanTerminalDetected === true;
+            }) === true,
+            terminal: false, method: 'node'};
     }
 
     // 当前真机的微信原生底部面板不提供任何无障碍节点。调用方已经通过
@@ -57,17 +71,24 @@ function clickNativePhoneAuthorizationCard() {
     let whitePoints = null;
     try {
         whitePoints = image.findColor(
-            gScreen, '#ffffff', 0.96, left, top, right, bottom, 4, 1
+            gScreen, '0xffffff', 0.90, left, top, right, bottom, 4, 1
         );
     } catch (visualError) {
         logw('手机号卡片视觉验证异常: ' + visualError);
     }
-    if (!whitePoints || whitePoints.length < 4) return false;
-    return humanizedPointClick(
+    const visualConfirmed = !!(whitePoints && whitePoints.length >= 4);
+    if (!sheetTitleConfirmed && !visualConfirmed) {
+        return {confirmed: false, submitted: false, terminal: false, method: 'none'};
+    }
+    if (config.scanTerminalDetected === true) {
+        return {confirmed: true, submitted: false, terminal: true,
+            method: sheetTitleConfirmed ? 'title' : 'visual'};
+    }
+    return {confirmed: true, submitted: humanizedPointClick(
         random(~~(width * 0.38), ~~(width * 0.62)),
         random(~~(height * 0.635), ~~(height * 0.655)),
-        3
-    ) === true;
+        3, function () { return config.scanTerminalDetected === true; }
+    ) === true, terminal: false, method: sheetTitleConfirmed ? 'title' : 'visual'};
 }
 
 let config = {
@@ -94,6 +115,7 @@ let config = {
     actionHeartbeatStop: true,
     actionHeartbeatGeneration: 0,
     actionPreemptRequested: false,
+    scanTerminalDetected: false, // 后台确认扫码成功后立即停止主线程继续识别/点击授权卡片
     lastClaimAuditTaskId: null,
     verifiedActionAccount: null,
     verifiedActionAccountAt: 0,
@@ -1293,10 +1315,19 @@ function saoma(taskId, taskDeadline) {
     let lastAuthorizationActionTime = 0; // 授权控件点击节流，防止卡页时连续点击
     let authorizationPageLogged = false;
     let phoneAuthorizationAttempts = 0; // 原生手机号卡片是最终授权，每轮最多点击2次
-    let nativePhoneSheetExpected = false; // 橙色入口点击成功后，白色原生面板必然出现
+    let nativePhoneSheetExpected = false; // 仅表示橙色入口已点击，不等于白色面板已确认
+    let nativePhoneSheetExpectedAt = 0;
+    let nativePhoneSheetConfirmed = false;
+    let phoneSheetWarningLogged = false;
     let recoveryCount = 0;
     while (time() < scanDeadline) {
         if ( config.step!==4) return -999
+        // 后台结果线程已经确认成功但仍在上传时，主线程只等待步骤切换，
+        // 绝不能继续读取旧页面、点击授权卡片或制造成功后的过期警告。
+        if (config.scanTerminalDetected === true) {
+            sleep(100);
+            continue;
+        }
 
         // “验证失败”经常是微信侧瞬时状态，同一任务立即重扫通常可以成功。
         // 后台线程只负责发现结果，重启微信和重扫必须由主线程执行，避免节点锁竞态。
@@ -1325,6 +1356,9 @@ function saoma(taskId, taskDeadline) {
             authorizationPageLogged = false;
             phoneAuthorizationAttempts = 0;
             nativePhoneSheetExpected = false;
+            nativePhoneSheetExpectedAt = 0;
+            nativePhoneSheetConfirmed = false;
+            phoneSheetWarningLogged = false;
             continue;
         }
         keepScreen();
@@ -1337,28 +1371,39 @@ function saoma(taskId, taskDeadline) {
                 break;
             } else if (nativePhoneSheetExpected ||
                     jc.FindNode(text('申请获取并验证你的手机号'))) {
-                // 真机确认：橙色入口点击成功后白色面板稳定必现。即使该原生
-                // 面板不进入无障碍树，也按已确认的状态转换继续视觉安全点击。
-                nativePhoneSheetExpected = true;
-                logd('达到手机号授权界面');
+                // expected 只代表橙色入口已点击。只有标题、手机号节点或白色
+                // 卡片视觉区域实际成立，才允许记录“检测到”并执行安全点击。
                 if (scanAttemptStartTime === 0) scanAttemptStartTime = time();
-                if (!authorizationPageLogged) {
-                    upStepLog(taskId, 'saoma', '检测到手机号授权弹窗'); // 步骤日志L11
-                    authorizationPageLogged = true;
-                }
                 if (time() - lastAuthorizationActionTime >= 2500) {
                     if (phoneAuthorizationAttempts < 2) {
-                        const submitted = clickNativePhoneAuthorizationCard() === true;
-                        if (submitted) {
+                        const authorizationState = clickNativePhoneAuthorizationCard();
+                        // 无论本帧是否确认，都进行节流；此前失败不更新时间，导致
+                        // 同一张卡片每800ms向服务器刷一条“未验证”警告。
+                        lastAuthorizationActionTime = time();
+                        if (authorizationState.terminal || config.scanTerminalDetected === true) {
+                            sleep(100);
+                            continue;
+                        }
+                        if (authorizationState.confirmed) {
+                            nativePhoneSheetConfirmed = true;
+                            if (!authorizationPageLogged) {
+                                upStepLog(taskId, 'saoma', '已确认手机号授权弹窗，方式:' +
+                                    authorizationState.method); // 步骤日志L11
+                                authorizationPageLogged = true;
+                            }
+                        }
+                        if (authorizationState.submitted) {
                             phoneAuthorizationAttempts++;
-                            lastAuthorizationActionTime = time();
                             upStepLog(taskId, 'saoma',
                                 '已点击手机号卡片并提交最终授权，第' +
                                 phoneAuthorizationAttempts + '次'); // 步骤日志L12
                             sleep(3000);
-                        } else {
+                        } else if (!nativePhoneSheetConfirmed && !phoneSheetWarningLogged &&
+                                nativePhoneSheetExpectedAt > 0 &&
+                                time() - nativePhoneSheetExpectedAt >= 5000) {
                             upStepLog(taskId, 'saoma',
-                                '手机号卡片节点和视觉区域均未验证，等待重试', 'warn');
+                                '手机号授权面板尚未完成安全确认，继续等待', 'warn');
+                            phoneSheetWarningLogged = true;
                         }
                     }
                 }
@@ -1368,6 +1413,9 @@ function saoma(taskId, taskDeadline) {
                     const clickedPrompt = humanizedNodeClick(j_node) === true;
                     if (clickedPrompt) {
                         nativePhoneSheetExpected = true;
+                        nativePhoneSheetExpectedAt = time();
+                        nativePhoneSheetConfirmed = false;
+                        phoneSheetWarningLogged = false;
                         lastAuthorizationActionTime = time();
                         upStepLog(taskId, 'saoma', '已点击小程序手机号授权入口，等待微信授权弹窗');
                         sleep(2500);
@@ -1430,6 +1478,9 @@ function saoma(taskId, taskDeadline) {
                             authorizationPageLogged = false;
                             phoneAuthorizationAttempts = 0;
                             nativePhoneSheetExpected = false;
+                            nativePhoneSheetExpectedAt = 0;
+                            nativePhoneSheetConfirmed = false;
+                            phoneSheetWarningLogged = false;
                             upStepLog(taskId, 'saoma', '已点击相册图片，等待授权及验证结果'); // 步骤日志L10
                             sleep(5000)
                         }
@@ -1492,6 +1543,11 @@ function saoma(taskId, taskDeadline) {
         }
         // 后台线程可能在本轮节点查询期间已经确认成功并切回步骤1，禁止再执行超时重启。
         if (config.step !== 4) return -999;
+        if (config.scanTerminalDetected === true) {
+            image.recycleAllImage();
+            sleep(100);
+            continue;
+        }
         // 失败信号优先交给下一轮顶部统一处理，不能同时触发授权超时恢复并重复计数。
         if (config.validationFailurePending) {
             image.recycleAllImage();
@@ -1521,6 +1577,9 @@ function saoma(taskId, taskDeadline) {
             authorizationPageLogged = false;
             phoneAuthorizationAttempts = 0;
             nativePhoneSheetExpected = false;
+            nativePhoneSheetExpectedAt = 0;
+            nativePhoneSheetConfirmed = false;
+            phoneSheetWarningLogged = false;
         }
         image.recycleAllImage()
         sleep(800);
@@ -1614,6 +1673,7 @@ function main() {
     let scanTaskSnapshot = null; // 检测到结果时立即保存任务快照，防止竞态条件
     let activeTaskSnapshot = null; // 步骤4开始时保存的任务快照，确保后台线程只上报当前正在扫码的任务
     config.validationFailurePending = false; // 验证失败由主线程恢复，后台线程不得直接结束任务
+    config.scanTerminalDetected = false;
     thread.execAsync(function () {
         while (true) {
             // 非扫码结果阶段绝不触碰节点。此前线程即使在账号检查/微信动作期间
@@ -1633,11 +1693,13 @@ function main() {
                     config.step === 4 && activeTaskSnapshot && !scanTaskSnapshot) {
                     if (findNode(text('验证成功').clz('android.widget.TextView').pkg(config.pkgName))) {
                         logd('验证成功');
+                        config.scanTerminalDetected = true;
                         scanResult = 1;
                         // 使用步骤4开始时保存的快照，而不是当前的taskConfig
                         scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
                     } else if (findNode(text('解锁成功').clz('android.widget.TextView').pkg(config.pkgName))) {
                         logd('解锁成功');
+                        config.scanTerminalDetected = true;
                         scanResult = 1;
                         scanTaskSnapshot = {taskId: activeTaskSnapshot.taskId, wxName: activeTaskSnapshot.wxName};
                     } else if (findNode(text('验证失败').clz('android.widget.TextView').pkg(config.pkgName))) {
@@ -1832,6 +1894,7 @@ function main() {
                 // 步骤4开始时保存当前任务快照，供后台线程使用
                 activeTaskSnapshot = {taskId: taskConfig.taskId, wxName: taskConfig.wxName};
                 config.validationFailurePending = false;
+                config.scanTerminalDetected = false;
                 scanResult = saoma(taskConfig.taskId, taskConfig.taskDeadline);
                 // 后台线程没有提交过才由主线程提交
                 if (!resultUploaded) {
