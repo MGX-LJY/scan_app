@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":160,
+"version":161,
 "dialog":false,
-"msg": "修复扫码手机号授权、自动重注册及小程序关闭恢复",
+"msg": "修复长任务租约、视频号与朋友圈收尾超时",
 "force": true,
-"md5":"c5e3a555e17c74bb0f4cd512f00aa341",
+"md5":"e17c43ee0101084da93dbf39f1f6287e",
 "download_timeout":300
 }
