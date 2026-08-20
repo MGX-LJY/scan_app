@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":161,
+"version":162,
 "dialog":false,
-"msg": "修复长任务租约、视频号与朋友圈收尾超时",
+"msg": "修复MIUI前台误判、视频号页面校验与朋友圈退出",
 "force": true,
-"md5":"e17c43ee0101084da93dbf39f1f6287e",
+"md5":"8f635bfbef3b079dd63fb71f7827f0d1",
 "download_timeout":300
 }
