@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":159,
+"version":160,
 "dialog":false,
-"msg": "修复统一任务领取确认并完善扫码手机号两阶段授权",
+"msg": "修复扫码手机号授权、自动重注册及小程序关闭恢复",
 "force": true,
-"md5":"a44037fdd93d84766494b561578b611e",
+"md5":"c5e3a555e17c74bb0f4cd512f00aa341",
 "download_timeout":300
 }
