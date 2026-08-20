@@ -825,7 +825,7 @@ function browseChannels(payload, shouldPreempt, taskDeadline) {
         clickKnownPageBack(detectWechatPage(), taskDeadline);
         return {success: false, error: '视频号页面校验失败'};
     }
-    const duration = Math.max(5, Math.min(1800, intOrDefault(payload.duration_seconds, 60)));
+    const duration = Math.max(5, Math.min(3600, intOrDefault(payload.duration_seconds, 60)));
     const maxSwipes = Math.max(0, Math.min(100, intOrDefault(payload.max_swipes, 30)));
     const dwellMin = Math.max(5, Math.min(120, intOrDefault(payload.dwell_min_seconds, 15)));
     const dwellMax = Math.max(dwellMin, Math.min(180, intOrDefault(payload.dwell_max_seconds, 30)));
@@ -1076,7 +1076,12 @@ function restoreToWechatHome(options) {
 
 function execute(task, shouldPreempt) {
     if (!task || hasSafetyBlocker()) return {success: false, error: '账号需要人工处理'};
-    const actionDeadline = task.hard_deadline || task.deadline;
+    const serverDeadline = task.hard_deadline || task.deadline;
+    // 长浏览动作必须给退出页面、恢复微信首页和结果上报留出固定时间。
+    // 服务器端为这两类任务增加10分钟硬截止缓冲，因此这里不会缩短计划浏览时长。
+    const recoveryReserveMs = task.action_type === 'channels_browse' ||
+        task.action_type === 'moment_browse' ? 60000 : 2000;
+    const actionDeadline = serverDeadline ? serverDeadline - recoveryReserveMs : serverDeadline;
     if (actionDeadline && time() >= actionDeadline - 2000) return {success: false, error: '任务执行时间已耗尽'};
     if (shouldPreempt && shouldPreempt()) return {success: false, preempted: true, error: '扫码任务抢占'};
     if (task.action_type === 'chat_text') return sendText(task.payload || {}, actionDeadline, shouldPreempt);
