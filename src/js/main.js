@@ -45,8 +45,9 @@ function clickNativePhoneAuthorizationCard() {
     }
 
     // 当前真机的微信原生底部面板不提供任何无障碍节点。调用方已经通过
-    // 唯一标题确认授权面板，这里再验证手机号卡片的白色区域，坐标回退
-    // 只能落在卡片中央安全区，绝不能碰到下方“不允许”。
+    // “橙色入口点击成功后的必然页面转换”或唯一标题确认授权面板，这里
+    // 再验证手机号卡片的白色区域；坐标只能落在中央安全区，绝不能碰到
+    // 下方“不允许”。
     const width = device.getScreenWidth();
     const height = device.getScreenHeight();
     const left = ~~(width * 0.10);
@@ -1292,6 +1293,7 @@ function saoma(taskId, taskDeadline) {
     let lastAuthorizationActionTime = 0; // 授权控件点击节流，防止卡页时连续点击
     let authorizationPageLogged = false;
     let phoneAuthorizationAttempts = 0; // 原生手机号卡片是最终授权，每轮最多点击2次
+    let nativePhoneSheetExpected = false; // 橙色入口点击成功后，白色原生面板必然出现
     let recoveryCount = 0;
     while (time() < scanDeadline) {
         if ( config.step!==4) return -999
@@ -1322,6 +1324,7 @@ function saoma(taskId, taskDeadline) {
             lastAuthorizationActionTime = 0;
             authorizationPageLogged = false;
             phoneAuthorizationAttempts = 0;
+            nativePhoneSheetExpected = false;
             continue;
         }
         keepScreen();
@@ -1332,7 +1335,11 @@ function saoma(taskId, taskDeadline) {
                 config.scanFailureReason = '二维码已发送至其他手机号，需要人工介入';
                 retVal = 0;
                 break;
-            } else if (jc.FindNode(text('申请获取并验证你的手机号'))) {
+            } else if (nativePhoneSheetExpected ||
+                    jc.FindNode(text('申请获取并验证你的手机号'))) {
+                // 真机确认：橙色入口点击成功后白色面板稳定必现。即使该原生
+                // 面板不进入无障碍树，也按已确认的状态转换继续视觉安全点击。
+                nativePhoneSheetExpected = true;
                 logd('达到手机号授权界面');
                 if (scanAttemptStartTime === 0) scanAttemptStartTime = time();
                 if (!authorizationPageLogged) {
@@ -1360,6 +1367,7 @@ function saoma(taskId, taskDeadline) {
                 if (time() - lastAuthorizationActionTime >= 4000) {
                     const clickedPrompt = humanizedNodeClick(j_node) === true;
                     if (clickedPrompt) {
+                        nativePhoneSheetExpected = true;
                         lastAuthorizationActionTime = time();
                         upStepLog(taskId, 'saoma', '已点击小程序手机号授权入口，等待微信授权弹窗');
                         sleep(2500);
@@ -1421,6 +1429,7 @@ function saoma(taskId, taskDeadline) {
                             lastAuthorizationActionTime = 0;
                             authorizationPageLogged = false;
                             phoneAuthorizationAttempts = 0;
+                            nativePhoneSheetExpected = false;
                             upStepLog(taskId, 'saoma', '已点击相册图片，等待授权及验证结果'); // 步骤日志L10
                             sleep(5000)
                         }
@@ -1511,6 +1520,7 @@ function saoma(taskId, taskDeadline) {
             lastAuthorizationActionTime = 0;
             authorizationPageLogged = false;
             phoneAuthorizationAttempts = 0;
+            nativePhoneSheetExpected = false;
         }
         image.recycleAllImage()
         sleep(800);
