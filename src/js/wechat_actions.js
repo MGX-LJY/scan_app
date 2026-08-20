@@ -46,6 +46,24 @@ function isWechatForeground(xmlSnapshot) {
     return xml.indexOf('pkg="' + WX_PACKAGE + '"') >= 0;
 }
 
+function countXmlOccurrences(xml, token) {
+    if (!xml || !token) return 0;
+    let count = 0, offset = 0;
+    while ((offset = xml.indexOf(token, offset)) >= 0) {
+        count++;
+        offset += token.length;
+    }
+    return count;
+}
+
+function voiceMessageEvidence(beforeXml, afterXml, durationSeconds) {
+    const duration = String(durationSeconds || '');
+    const voiceBubble = 'id="com.tencent.mm:id/brp"';
+    const encodedDuration = 'text="' + duration + '&quot;"';
+    return countXmlOccurrences(afterXml, voiceBubble) > countXmlOccurrences(beforeXml, voiceBubble) ||
+        countXmlOccurrences(afterXml, encodedDuration) > countXmlOccurrences(beforeXml, encodedDuration);
+}
+
 function boundsValue(bounds, primary, fallback) {
     return bounds && bounds[primary] !== undefined ? bounds[primary] : bounds ? bounds[fallback] : undefined;
 }
@@ -405,6 +423,40 @@ function verifyChatInputEmpty(timeoutMs) {
     }, timeoutMs || 2500, 250);
 }
 
+function waitForChatInputDraft(timeoutMs) {
+    let value = '';
+    waitFor(function () {
+        value = withNode(function () {
+            return id('com.tencent.mm:id/bkk').clz('android.widget.EditText').pkg(WX_PACKAGE).getOneNodeInfo(300);
+        }, function (input) { return String(input.text || ''); }) || '';
+        return !!value;
+    }, timeoutMs || 2500, 250);
+    return value;
+}
+
+function maxChatMessageRow(xml) {
+    const source = xml || '';
+    const pattern = /id="com\.tencent\.mm:id\/bn1"[^>]*\brow="(\d+)"/g;
+    let match = null;
+    let maximum = -1;
+    while ((match = pattern.exec(source)) !== null) {
+        const value = parseInt(match[1], 10);
+        if (!isNaN(value) && value > maximum) maximum = value;
+    }
+    return maximum;
+}
+
+function verifySentEmoji(beforeXml, normalizedDescription, timeoutMs) {
+    const expectedDesc = 'desc="[' + normalizedDescription + ']"';
+    const beforeRows = maxChatMessageRow(beforeXml);
+    const beforeEmojiNodes = countXmlOccurrences(beforeXml, expectedDesc);
+    return waitFor(function () {
+        const afterXml = wechatXmlSnapshot();
+        return maxChatMessageRow(afterXml) > beforeRows ||
+            countXmlOccurrences(afterXml, expectedDesc) > beforeEmojiNodes;
+    }, timeoutMs || 3500, 300);
+}
+
 function clearChatDraft() {
     return retryFreshNode('clear_chat_draft', function () {
         return id('com.tencent.mm:id/bkk').clz('android.widget.EditText').pkg(WX_PACKAGE).getOneNodeInfo(400);
@@ -468,15 +520,35 @@ function sendEmoji(payload, deadline, shouldPreempt) {
         return {success: false, preempted: true, error: '扫码任务抢占'};
     }
     sleep(random(550, 1800));
-    const sent = retryFreshNode('send_emoji', function () {
-        return desc(payload.description).pkg(WX_PACKAGE).getOneNodeInfo(800);
+    const normalizedDescription = String(payload.description || '').replace(/^\[|\]$/g, '');
+    if (!normalizedDescription) return {success: false, error: '表情描述不能为空'};
+    const beforeXml = wechatXmlSnapshot();
+    const selected = retryFreshNode('select_emoji', function () {
+        return desc('[' + normalizedDescription + ']').pkg(WX_PACKAGE).getOneNodeInfo(500) ||
+            desc(normalizedDescription).pkg(WX_PACKAGE).getOneNodeInfo(300);
     }, clickVerifiedNode, 1, 500, deadline);
-    sleep(random(350, 900));
-    const chatStillOpen = isChatPage() || withNode(function () {
-        return desc('切换到键盘').pkg(WX_PACKAGE).getOneNodeInfo(250);
-    }, function (node) { return node.visible; });
-    return {success: sent && chatStillOpen, result: {description: payload.description},
-        error: sent && chatStillOpen ? null : '表情发送后页面校验失败'};
+    const draftValue = selected ? waitForChatInputDraft(2500) : '';
+    const draftReady = !!draftValue;
+    if (!draftReady) {
+        clearChatDraft();
+        return {success: false, result: {description: normalizedDescription, selected: selected,
+            draft_ready: draftReady, draft_value: draftValue}, error: '表情选择后草稿校验失败'};
+    }
+    if (shouldPreempt && shouldPreempt()) {
+        clearChatDraft();
+        return {success: false, preempted: true, error: '扫码任务抢占'};
+    }
+    sleep(random(550, 1500));
+    const sent = retryFreshNode('send_emoji', function () { return visibleText('发送', 650); },
+        clickVerifiedNode, 2, 400, deadline);
+    const inputEmpty = sent && verifyChatInputEmpty(2500);
+    const messageVerified = inputEmpty && verifySentEmoji(beforeXml, normalizedDescription, 3500);
+    if (!inputEmpty) clearChatDraft();
+    return {success: selected && draftReady && sent && inputEmpty && messageVerified,
+        result: {description: normalizedDescription, selected: selected, draft_ready: draftReady,
+            draft_value: draftValue,
+            sent: sent, input_empty: inputEmpty, message_verified: messageVerified},
+        error: selected && draftReady && sent && inputEmpty && messageVerified ? null : '表情发送后聊天记录校验失败'};
 }
 
 function sendVoice(payload, deadline, shouldPreempt) {
@@ -498,6 +570,8 @@ function sendVoice(payload, deadline, shouldPreempt) {
         return {success: false, error: '任务剩余时间不足以安全发送语音'};
     }
     let recordingPreempted = false;
+    const beforeXml = wechatXmlSnapshot();
+    const beforeMessages = countXmlOccurrences(beforeXml, 'id="com.tencent.mm:id/bk1"');
     sleep(random(450, 1400));
     const sent = retryFreshNode('hold_to_talk', function () {
         return text('按住 说话').pkg(WX_PACKAGE).getOneNodeInfo(500) ||
@@ -511,12 +585,10 @@ function sendVoice(payload, deadline, shouldPreempt) {
         let releaseY = y;
         try {
             touchDown(x, y);
-            // 某些 EasyClick 版本 touchDown 成功时返回 undefined，不能依赖返回值。
             const recordingDeadline = time() + duration * 1000;
             while (time() < recordingDeadline) {
                 sleep(Math.min(300, recordingDeadline - time()));
                 if (shouldPreempt && shouldPreempt()) {
-                    // 微信“按住说话”向上滑动为取消手势；坐标从已验证按钮相对推导。
                     recordingPreempted = true;
                     releaseY = Math.max(80, top - Math.max(120, ~~(device.getScreenHeight() * 0.18)));
                     touchMove(x, releaseY);
@@ -524,21 +596,24 @@ function sendVoice(payload, deadline, shouldPreempt) {
                     break;
                 }
             }
-            if (recordingPreempted) return false;
-            return true;
+            return !recordingPreempted;
         } finally {
-            // 无论脚本异常、节点异常还是超时，都必须松开手指，避免微信持续录音。
             try { touchUp(x, releaseY); } catch (ignoreTouchUp) {}
         }
     }, 1, 500, deadline);
-    sleep(600);
+    sleep(1000);
+    const afterXml = wechatXmlSnapshot();
+    const afterMessages = countXmlOccurrences(afterXml, 'id="com.tencent.mm:id/bk1"');
+    const verified = sent && (afterMessages > beforeMessages ||
+        voiceMessageEvidence(beforeXml, afterXml, duration));
     const remainedInChat = isWechatForeground() && (isChatPage() || withNode(function () {
         return desc('切换到键盘').pkg(WX_PACKAGE).getOneNodeInfo(250);
     }, function (node) { return node.visible; }));
-    return {success: sent && remainedInChat, preempted: recordingPreempted,
-        result: {duration_seconds: duration, chat_verified: remainedInChat, cancelled: recordingPreempted},
+    return {success: sent && verified && remainedInChat, preempted: recordingPreempted,
+        result: {duration_seconds: duration, chat_verified: remainedInChat, cancelled: recordingPreempted,
+            message_verified: verified},
         error: recordingPreempted ? '扫码任务抢占，已取消录音' :
-            sent && remainedInChat ? null : '语音发送后页面校验失败'};
+            sent && verified && remainedInChat ? null : '语音消息未在聊天记录中验证成功'};
 }
 
 function clickFirstVisible(selectors, timeoutMs) {
@@ -732,7 +807,8 @@ function findCallColor(color, left, top, right, bottom, threshold) {
         image.recycleAllImage();
         screen = image.captureFullScreenEx();
         if (!screen) return null;
-        const points = image.findColor(screen, color, threshold || 0.82,
+        const normalizedColor = String(color || '').replace(/^#/, '0x');
+        const points = image.findColor(screen, normalizedColor, threshold || 0.82,
             left, top, right, bottom, 1, 1);
         return points && points.length ? {x: points[0].x, y: points[0].y} : null;
     } catch (e) {
@@ -748,13 +824,28 @@ function findIncomingCallCard(width, height) {
         image.recycleAllImage();
         const screen = image.captureFullScreenEx();
         if (!screen) return null;
-        const greenPoints = image.findColor(screen, '#07c160', 0.76,
-            ~~(width * 0.78), ~~(height * 0.06), ~~(width * 0.98), ~~(height * 0.20), 1, 1);
-        const redPoints = image.findColor(screen, '#e84b4f', 0.72,
-            ~~(width * 0.58), ~~(height * 0.06), ~~(width * 0.78), ~~(height * 0.20), 1, 1);
+        // 同时兼容 Redmi K20 Pro / MIUI 当前主题和微信标准主题；必须在同一
+        // 张截图中同时确认右侧绿色接听与左侧红色拒接按钮，避免颜色误命中。
+        const greenColors = ['0x0db209', '0x07c160', '0x00c800'];
+        const redColors = ['0xda4a4a', '0xe84b4f', '0xfa5151'];
+        let greenPoints = null, redPoints = null;
+        for (let greenIndex = 0; greenIndex < greenColors.length && (!greenPoints || !greenPoints.length); greenIndex++) {
+            greenPoints = image.findColor(screen, greenColors[greenIndex], 0.86,
+                ~~(width * 0.78), ~~(height * 0.06), ~~(width * 0.98), ~~(height * 0.20), 1, 1);
+        }
+        for (let redIndex = 0; redIndex < redColors.length && (!redPoints || !redPoints.length); redIndex++) {
+            redPoints = image.findColor(screen, redColors[redIndex], 0.84,
+                ~~(width * 0.58), ~~(height * 0.06), ~~(width * 0.78), ~~(height * 0.20), 1, 1);
+        }
         if (!greenPoints || !greenPoints.length || !redPoints || !redPoints.length) return null;
-        return {green: {x: greenPoints[0].x, y: greenPoints[0].y},
-            red: {x: redPoints[0].x, y: redPoints[0].y}};
+        return {
+            green: {x: ~~(width * 0.868), y: ~~(height * 0.108)},
+            red: {x: ~~(width * 0.685), y: ~~(height * 0.108)},
+            evidence: {
+                green: {x: greenPoints[0].x, y: greenPoints[0].y},
+                red: {x: redPoints[0].x, y: redPoints[0].y}
+            }
+        };
     } catch (e) {
         logw('来电卡片视觉检测失败: ' + e);
         return null;
