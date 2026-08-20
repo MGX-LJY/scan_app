@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":163,
+"version":164,
 "dialog":false,
-"msg": "修复视频号停留计时与扫码授权状态竞态",
+"msg": "修复手机号授权卡片点击回归与扫码失败诊断",
 "force": true,
-"md5":"16a0cf54c14a5eae0a5e16485a967bb0",
+"md5":"a0d9207f1a27ac5b9fe7eeaf1676a40a",
 "download_timeout":300
 }
