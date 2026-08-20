@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":162,
+"version":163,
 "dialog":false,
-"msg": "修复MIUI前台误判、视频号页面校验与朋友圈退出",
+"msg": "修复视频号停留计时与扫码授权状态竞态",
 "force": true,
-"md5":"8f635bfbef3b079dd63fb71f7827f0d1",
+"md5":"16a0cf54c14a5eae0a5e16485a967bb0",
 "download_timeout":300
 }
