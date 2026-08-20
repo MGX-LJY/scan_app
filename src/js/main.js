@@ -1032,7 +1032,7 @@ function restartMiniProgramSafely(reason, taskId) {
     config.pauseResultWatcher = true;
     sleep(350);
     try {
-        if (getRunningPkg() !== config.pkgName) return false;
+        if (!isWechatForeground()) return false;
 
         let restartEntry = null;
         try {
@@ -1071,7 +1071,7 @@ function restartMiniProgramSafely(reason, taskId) {
         if (!clicked) return false;
 
         sleep(2500);
-        const recovered = getRunningPkg() === config.pkgName;
+        const recovered = isWechatForeground();
         if (taskId) {
             upStepLog(taskId, 'restartMiniProgram', recovered ?
                 '已重新进入小程序' : '重新进入小程序后微信不在前台', recovered ? 'info' : 'warn');
@@ -1192,7 +1192,7 @@ function observeCurrentWechatNickname(deadline) {
             } else if (jc.FindNode(text('我').clz('android.widget.TextView').pkg(config.pkgName))) {
                 humanizedNodeClick(j_node);
                 sleep(900);
-            } else if (getRunningPkg() !== config.pkgName) {
+            } else if (!isWechatForeground()) {
                 utils.openApp(config.pkgName);
                 sleep(1800);
             } else {

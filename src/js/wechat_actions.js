@@ -10,6 +10,42 @@ const runtime = {
     chatVerifiedAt: 0
 };
 
+function wechatXmlSnapshot() {
+    try {
+        return dumpXml() || '';
+    } catch (snapshotError) {
+        logw('微信页面快照失败: ' + snapshotError);
+        return '';
+    }
+}
+
+function runningWechatActivity() {
+    try {
+        return String(getRunningActivity() || '');
+    } catch (activityError) {
+        return '';
+    }
+}
+
+/**
+ * MIUI 的无障碍环境偶尔会让 getRunningPkg() 返回 null，即使微信的
+ * FinderHomeAffinityUI/LauncherUI 正在前台。非空的其他包名仍然立即拒绝；
+ * 只有包名不可用时，才用当前 Activity 和同一时刻的节点快照交叉确认。
+ */
+function isWechatForeground(xmlSnapshot) {
+    let pkg = null;
+    try { pkg = getRunningPkg(); } catch (pkgError) {}
+    if (pkg === WX_PACKAGE) return true;
+    if (pkg !== null && pkg !== undefined && String(pkg).length > 0) return false;
+    const activity = runningWechatActivity();
+    if (activity.indexOf(WX_PACKAGE) >= 0) return true;
+    // 某些 ROM 只返回相对类名（如 .plugin.finder...）或短类名，
+    // 这种结果不足以否定微信，继续以当前 XML 包名确认。
+    if (activity && activity.charAt(0) !== '.' && activity.indexOf('.') >= 0) return false;
+    const xml = xmlSnapshot === undefined ? wechatXmlSnapshot() : (xmlSnapshot || '');
+    return xml.indexOf('pkg="' + WX_PACKAGE + '"') >= 0;
+}
+
 function boundsValue(bounds, primary, fallback) {
     return bounds && bounds[primary] !== undefined ? bounds[primary] : bounds ? bounds[fallback] : undefined;
 }
@@ -113,7 +149,7 @@ function withNode(factory, operation) {
 function retryFreshNode(label, factory, operation, attempts, intervalMs, deadline) {
     const maxAttempts = Math.max(1, Math.min(5, ~~attempts || 3));
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        if ((deadline && time() >= deadline) || getRunningPkg() !== WX_PACKAGE || hasSafetyBlocker()) {
+        if ((deadline && time() >= deadline) || !isWechatForeground() || hasSafetyBlocker()) {
             logw('微信动作中止 label=' + label + ' reason=unsafe_or_timeout');
             return false;
         }
@@ -203,17 +239,16 @@ function isMainTabActive(tabName) {
 }
 
 function detectWechatPage() {
-    if (getRunningPkg() !== WX_PACKAGE) return WX_PAGE.OTHER;
-    let xml = '';
-    try { xml = dumpXml() || ''; } catch (snapshotError) {
-        logw('微信页面快照失败: ' + snapshotError);
-    }
+    const xml = wechatXmlSnapshot();
+    if (!isWechatForeground(xml)) return WX_PAGE.OTHER;
     function attr(name, value) { return xml.indexOf(name + '="' + value + '"') >= 0; }
     const blockers = ['登录', '手机号登录', '微信安全中心', '安全验证', '请输入验证码'];
     for (let blockerIndex = 0; blockerIndex < blockers.length; blockerIndex++) {
         if (attr('text', blockers[blockerIndex])) return WX_PAGE.BLOCKED;
     }
     if (attr('id', 'com.tencent.mm:id/d98')) return WX_PAGE.SEARCH;
+    if (attr('text', '退出此次编辑？') || attr('text', '退出此次编辑?')) return WX_PAGE.MOMENT_EDITOR;
+    if (attr('text', '保留此次编辑？') || attr('text', '保留此次编辑?')) return WX_PAGE.MOMENT_EDITOR;
     if (attr('id', 'com.tencent.mm:id/n7y')) return WX_PAGE.MOMENT_EDITOR;
     if (attr('desc', '拍照分享') && attr('id', 'com.tencent.mm:id/actionbar_up_indicator')) return WX_PAGE.MOMENTS;
     if (attr('desc', '关注') && attr('desc', '推荐')) return WX_PAGE.CHANNELS;
@@ -497,7 +532,7 @@ function sendVoice(payload, deadline, shouldPreempt) {
         }
     }, 1, 500, deadline);
     sleep(600);
-    const remainedInChat = getRunningPkg() === WX_PACKAGE && (isChatPage() || withNode(function () {
+    const remainedInChat = isWechatForeground() && (isChatPage() || withNode(function () {
         return desc('切换到键盘').pkg(WX_PACKAGE).getOneNodeInfo(250);
     }, function (node) { return node.visible; }));
     return {success: sent && remainedInChat, preempted: recordingPreempted,
@@ -665,7 +700,7 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
         if (state === '通话结束') { endReason = 'remote_ended'; break; }
         if (state === '通话中' || (!state && hangupVisible && time() - startedAt > 2500)) answered = true;
         if (!answered && time() >= ringDeadline) { endReason = 'ring_timeout'; break; }
-        if (getRunningPkg() !== WX_PACKAGE) { endReason = 'wechat_not_foreground'; break; }
+        if (!isWechatForeground()) { endReason = 'wechat_not_foreground'; break; }
         // 控制栏会自动隐藏；节点暂时消失不代表通话已经结束。
         sleep(800);
     }
@@ -748,7 +783,7 @@ function answerIncomingCall(payload, shouldPreempt, taskDeadline) {
         const callState = voiceCallPageState();
         if (callState.text === '通话结束' || callState.text === '对方已拒绝' ||
             callState.text === '对方忙线') { reason = 'remote_ended'; break; }
-        if (getRunningPkg() !== WX_PACKAGE) { reason = 'wechat_not_foreground'; break; }
+        if (!isWechatForeground()) { reason = 'wechat_not_foreground'; break; }
         sleep(500);
     }
     const hungUp = reason === 'remote_ended' ? true : hangUpVoiceCall(true);
@@ -782,13 +817,9 @@ function openDiscoverItem(item, deadline) {
 }
 
 function isChannelsPage() {
-    const following = withNode(function () {
-        return desc('关注').pkg(WX_PACKAGE).getOneNodeInfo(250);
-    }, function (node) { return node.visible; });
-    const recommended = withNode(function () {
-        return desc('推荐').pkg(WX_PACKAGE).getOneNodeInfo(250);
-    }, function (node) { return node.visible; });
-    return following && recommended;
+    const xml = wechatXmlSnapshot();
+    if (!isWechatForeground(xml)) return false;
+    return xml.indexOf('desc="关注"') >= 0 && xml.indexOf('desc="推荐"') >= 0;
 }
 
 function clickCurrentChannelLike() {
@@ -820,15 +851,20 @@ function clickCurrentChannelLike() {
 function browseChannels(payload, shouldPreempt, taskDeadline) {
     const startedAt = time();
     if (!openDiscoverItem('视频号', taskDeadline)) return {success: false, error: '无法进入视频号'};
-    sleep(1300);
-    if (!isChannelsPage()) {
+    if (!waitFor(isChannelsPage, 6000, 300)) {
         clickKnownPageBack(detectWechatPage(), taskDeadline);
         return {success: false, error: '视频号页面校验失败'};
     }
     const duration = Math.max(5, Math.min(3600, intOrDefault(payload.duration_seconds, 60)));
-    const maxSwipes = Math.max(0, Math.min(100, intOrDefault(payload.max_swipes, 30)));
     const dwellMin = Math.max(5, Math.min(120, intOrDefault(payload.dwell_min_seconds, 15)));
     const dwellMax = Math.max(dwellMin, Math.min(180, intOrDefault(payload.dwell_max_seconds, 30)));
+    const explicitSwipeLimit = payload.max_swipes !== undefined && payload.max_swipes !== null &&
+        payload.max_swipes !== '';
+    // 日程任务通常只给浏览时长和停留区间。默认上限必须覆盖整个计划窗口，
+    // 不能用固定30次把26—47分钟任务截断成约7.5—15分钟。
+    const maxSwipes = explicitSwipeLimit ?
+        Math.max(0, Math.min(720, intOrDefault(payload.max_swipes, 30))) :
+        Math.max(1, Math.min(720, Math.ceil(duration / dwellMin) + 1));
     const likeBudget = payload.confirm_external === true ?
         Math.max(0, Math.min(10, intOrDefault(payload.interaction_budget, 0))) : 0;
     const likeProbability = Math.max(0, Math.min(100,
@@ -853,21 +889,22 @@ function browseChannels(payload, shouldPreempt, taskDeadline) {
             }
         }
         if (time() >= deadline) break;
-        if (!isChannelsPage()) { reason = 'page_changed'; break; }
+        if (!waitFor(isChannelsPage, 1500, 250)) { reason = 'page_changed'; break; }
         const width = device.getScreenWidth(), height = device.getScreenHeight();
         swipeToPoint(random(~~(width * 0.43), ~~(width * 0.57)), ~~(height * 0.78),
             random(~~(width * 0.43), ~~(width * 0.57)), ~~(height * 0.28), random(450, 800));
-        swipes++; sleep(700);
-        if (!isChannelsPage()) { reason = 'page_changed_after_swipe'; break; }
+        swipes++;
+        if (!waitFor(isChannelsPage, 2500, 250)) { reason = 'page_changed_after_swipe'; break; }
     }
     if (swipes >= maxSwipes && time() < deadline && reason === 'duration_complete') reason = 'swipe_limit';
-    if (getRunningPkg() === WX_PACKAGE && detectWechatPage() === WX_PAGE.CHANNELS) {
+    if (isWechatForeground() && detectWechatPage() === WX_PAGE.CHANNELS) {
         clickKnownPageBack(WX_PAGE.CHANNELS, taskDeadline);
     }
     const success = reason === 'duration_complete' || reason === 'swipe_limit';
     return {success: success, preempted: reason === 'scan_preempted',
         result: {swipes: swipes, likes: likes,
-            elapsed_seconds: ~~((time() - startedAt) / 1000), end_reason: reason},
+            elapsed_seconds: ~~((time() - startedAt) / 1000), end_reason: reason,
+            max_swipes: maxSwipes, swipe_limit_source: explicitSwipeLimit ? 'payload' : 'duration'},
         error: success ? null : reason === 'scan_preempted' ? '扫码任务抢占' : '视频号浏览中断: ' + reason};
 }
 
@@ -878,16 +915,81 @@ function momentEditorVisible() {
     }, function (editor) { return editor.visible; });
 }
 
+function momentExitPromptVisible() {
+    return withNode(function () {
+        return textMatch('^退出此次编辑[？?]$').pkg(WX_PACKAGE).getOneNodeInfo(250);
+    }, function (prompt) { return prompt.visible; });
+}
+
+function momentKeepPromptVisible() {
+    return withNode(function () {
+        return textMatch('^保留此次编辑[？?]$').pkg(WX_PACKAGE).getOneNodeInfo(250);
+    }, function (prompt) { return prompt.visible; });
+}
+
+function confirmMomentExitPrompt() {
+    if (!momentExitPromptVisible()) return false;
+    return retryFreshNode('confirm_moment_exit', function () {
+        return id('com.tencent.mm:id/mm_alert_ok_btn').text('退出').pkg(WX_PACKAGE).getOneNodeInfo(450);
+    }, clickVerifiedNode, 2, 300, time() + 1800);
+}
+
+function confirmMomentDiscardPrompt() {
+    if (!momentKeepPromptVisible()) return false;
+    return retryFreshNode('confirm_moment_discard', function () {
+        return id('com.tencent.mm:id/mm_alert_cancel_btn').text('不保留')
+            .pkg(WX_PACKAGE).getOneNodeInfo(450);
+    }, clickVerifiedNode, 2, 300, time() + 1800);
+}
+
+function waitMomentEditorClosed(timeoutMs) {
+    return waitFor(function () {
+        return !momentEditorVisible() && !momentExitPromptVisible() &&
+            !momentKeepPromptVisible() && detectWechatPage() === WX_PAGE.MOMENTS;
+    }, timeoutMs || 4000, 250);
+}
+
 function cancelMomentDraft() {
+    if (momentKeepPromptVisible()) {
+        return confirmMomentDiscardPrompt() && waitMomentEditorClosed(4000);
+    }
+    if (momentExitPromptVisible()) {
+        return confirmMomentExitPrompt() && waitMomentEditorClosed(4000);
+    }
     retryFreshNode('clear_moment_draft', function () {
         return id('com.tencent.mm:id/n7y').pkg(WX_PACKAGE).getOneNodeInfo(400) ||
             clz('android.widget.EditText').pkg(WX_PACKAGE).getOneNodeInfo(250);
     }, function (editor) { clickNodeSafeArea(editor); editor.clearText(); return true; }, 2, 300);
-    for (let attempt = 0; attempt < 2 && momentEditorVisible(); attempt++) {
-        back(); sleep(600);
-        clickFirstVisible([text('不保留').pkg(WX_PACKAGE), text('放弃').pkg(WX_PACKAGE)], 300);
+    for (let attempt = 0; attempt < 3; attempt++) {
+        if (waitMomentEditorClosed(500)) return true;
+        if (momentKeepPromptVisible()) {
+            if (confirmMomentDiscardPrompt() && waitMomentEditorClosed(4000)) return true;
+            continue;
+        }
+        if (momentExitPromptVisible()) {
+            if (confirmMomentExitPrompt() && waitMomentEditorClosed(4000)) return true;
+            continue;
+        }
+        if (!momentEditorVisible()) {
+            sleep(800);
+            continue;
+        }
+        back(); sleep(350);
+        // 第一次 back 可能只收起键盘；等待节点树稳定后再判断，下一轮
+        // 才会再次 back，避免动画期间连续返回关闭确认对话框。
+        sleep(2150);
+        if (momentKeepPromptVisible()) {
+            if (!confirmMomentDiscardPrompt()) continue;
+        } else if (momentExitPromptVisible()) {
+            if (!confirmMomentExitPrompt()) continue;
+        } else if (detectWechatPage() === WX_PAGE.MOMENTS) {
+            return true;
+        } else {
+            clickFirstVisible([text('不保留').pkg(WX_PACKAGE), text('放弃').pkg(WX_PACKAGE)], 300);
+        }
+        if (waitMomentEditorClosed(4000)) return true;
     }
-    return !momentEditorVisible();
+    return waitMomentEditorClosed(1000);
 }
 
 function browseMoments(payload, deadline, shouldPreempt) {
@@ -1020,7 +1122,7 @@ function restoreToWechatHome(options) {
             trace.push(miniProgramClosed ? 'mini_program_closed' : 'mini_program_close_failed');
         }
         let page = detectWechatPage();
-        if (page === WX_PAGE.UNKNOWN && getRunningPkg() === WX_PACKAGE) {
+        if (page === WX_PAGE.UNKNOWN && isWechatForeground()) {
             // 通话或视频号退出动画会短暂没有稳定节点，先等待页面落定再决定是否启用Launcher兜底。
             waitFor(function () {
                 page = detectWechatPage();
@@ -1106,8 +1208,9 @@ function execute(task, shouldPreempt) {
     if (task.action_type === 'device_wake') {
         utils.openApp(WX_PACKAGE);
         sleep(1000);
-        return {success: getRunningPkg() === WX_PACKAGE,
-            result: {runtime_mode: 'idle'}, error: getRunningPkg() === WX_PACKAGE ? null : '微信唤醒失败'};
+        const foreground = isWechatForeground();
+        return {success: foreground,
+            result: {runtime_mode: 'idle'}, error: foreground ? null : '微信唤醒失败'};
     }
     return {success: false, error: '不支持的动作类型: ' + task.action_type};
 }
