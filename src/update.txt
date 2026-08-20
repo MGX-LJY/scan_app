@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":164,
+"version":165,
 "dialog":false,
-"msg": "修复手机号授权卡片点击回归与扫码失败诊断",
+"msg": "修复表情与语音发送校验及来电识别",
 "force": true,
-"md5":"a0d9207f1a27ac5b9fe7eeaf1676a40a",
+"md5":"28acaf0391ecb45456920c01b632b1bf",
 "download_timeout":300
 }
