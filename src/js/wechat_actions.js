@@ -963,6 +963,37 @@ function postMoment(payload, deadline, shouldPreempt) {
         error: posted && editorClosed ? null : posted ? '发表后页面未退出，结果不确定' : '发表按钮点击失败'};
 }
 
+function closeVisibleMiniProgram(deadline) {
+    let closeNode = null;
+    let present = false;
+    let clicked = false;
+    try {
+        closeNode = id('com.tencent.mm:id/gn').desc('关闭').pkg(WX_PACKAGE)
+            .getOneNodeInfo(Math.min(700, Math.max(150, (deadline || time() + 700) - time())));
+        if (!closeNode || !closeNode.visible) return {present: false, clicked: false};
+        const bounds = closeNode.bounds || {};
+        const left = boundsValue(bounds, 'left', 'l');
+        const top = boundsValue(bounds, 'top', 't');
+        const right = boundsValue(bounds, 'right', 'r');
+        const bottom = boundsValue(bounds, 'bottom', 'b');
+        present = left >= device.getScreenWidth() * 0.80 &&
+            top >= 0 && right <= device.getScreenWidth() &&
+            bottom <= device.getScreenHeight() * 0.15;
+        if (!present) return {present: false, clicked: false};
+        clicked = clickVerifiedNode(closeNode) === true;
+    } catch (e) {
+        logw('退出小程序节点操作失败: ' + e);
+    } finally {
+        releaseNode();
+    }
+    if (clicked) {
+        waitFor(function () {
+            return detectWechatPage() !== WX_PAGE.UNKNOWN;
+        }, Math.min(6000, Math.max(800, (deadline || time() + 6000) - time())), 250);
+    }
+    return {present: present, clicked: clicked};
+}
+
 function restoreToWechatHome(options) {
     options = options || {};
     const startedAt = time();
@@ -971,12 +1002,22 @@ function restoreToWechatHome(options) {
     let callHungUp = false;
     let draftCleaned = false;
     let launcherFallback = false;
+    let miniProgramDetected = false;
+    let miniProgramClosed = false;
     try {
         // 通话必须最先终止，否则 LauncherUI 可能只缩小通话悬浮层。
         if (voiceCallPageState().voip_activity) {
             callHungUp = hangUpVoiceCall(true);
             trace.push(callHungUp ? 'call_hung_up' : 'call_hangup_failed');
             sleep(random(350, 700));
+        }
+        // 小程序必须使用右上角胶囊中的“关闭”退出，再回微信首页；不得把
+        // 小程序未知页交给 LauncherUI 覆盖，更不能为此重启或退出微信。
+        const miniProgram = closeVisibleMiniProgram(deadline);
+        miniProgramDetected = miniProgram.present === true;
+        miniProgramClosed = miniProgram.clicked === true;
+        if (miniProgramDetected) {
+            trace.push(miniProgramClosed ? 'mini_program_closed' : 'mini_program_close_failed');
         }
         let page = detectWechatPage();
         if (page === WX_PAGE.UNKNOWN && getRunningPkg() === WX_PACKAGE) {
@@ -1002,7 +1043,7 @@ function restoreToWechatHome(options) {
             if (!left) break;
             sleep(random(250, 600));
         }
-        if (detectWechatPage() !== WX_PAGE.MAIN) {
+        if (detectWechatPage() !== WX_PAGE.MAIN && !miniProgramDetected) {
             launcherFallback = true;
             const requested = utils.openActivity({pkg: WX_PACKAGE,
                 className: 'com.tencent.mm.ui.LauncherUI'});
@@ -1019,12 +1060,14 @@ function restoreToWechatHome(options) {
         runtime.chatVerifiedAt = 0;
         return {success: homeReady, call_hung_up: callHungUp,
             draft_cleaned: draftCleaned, launcher_fallback: launcherFallback,
+            mini_program_detected: miniProgramDetected, mini_program_closed: miniProgramClosed,
             elapsed_ms: time() - startedAt, trace: trace};
     } catch (e) {
         runtime.currentChatContact = null;
         runtime.chatVerifiedAt = 0;
         return {success: false, error: '' + e, call_hung_up: callHungUp,
             draft_cleaned: draftCleaned, launcher_fallback: launcherFallback,
+            mini_program_detected: miniProgramDetected, mini_program_closed: miniProgramClosed,
             elapsed_ms: time() - startedAt, trace: trace};
     } finally {
         try { releaseNode(); } catch (ignoreRelease) {}
