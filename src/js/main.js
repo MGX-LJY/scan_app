@@ -60,6 +60,7 @@ let config = {
     actionHeartbeatStop: true,
     actionHeartbeatGeneration: 0,
     actionPreemptRequested: false,
+    lastClaimAuditTaskId: null,
     verifiedActionAccount: null,
     verifiedActionAccountAt: 0,
     lastObservedWechatName: null,
@@ -261,8 +262,20 @@ function getWechatActionTask() {
             // account_id 是服务器稳定编号；wechat_name 是手机微信界面真实昵称。
             unifiedTask.account = unifiedTask.wechat_name || unifiedTask.account_id;
             unifiedTask.deadline = unifiedTask.soft_deadline;
-            queuePhoneAudit(unifiedTask, 'task_claimed_on_phone', 'claimed', 'info',
-                {action_type: unifiedTask.action_type});
+            // ACK 必须和领取处于同一条同步调用链。1.58 在 main 循环把任务对象
+            // 交给 processWechatAction 后才 ACK；真机上交接处发生运行时中断时，
+            // 服务器会不断重发 dispatching 租约，最终整批计划硬超时。
+            if (!ackWechatActionTask(unifiedTask)) {
+                queuePhoneAudit(unifiedTask, 'task_ack_failed_on_phone', 'ack_failed', 'error',
+                    {action_type: unifiedTask.action_type});
+                return null;
+            }
+            unifiedTask.acknowledged_on_claim = true;
+            if (config.lastClaimAuditTaskId !== unifiedTask.task_id) {
+                queuePhoneAudit(unifiedTask, 'task_claimed_on_phone', 'assigned', 'info',
+                    {action_type: unifiedTask.action_type, acknowledged: true});
+                config.lastClaimAuditTaskId = unifiedTask.task_id;
+            }
             return unifiedTask;
         }
     } catch (e) {
@@ -476,7 +489,8 @@ function processWechatAction(task) {
             if (!flushPendingActionResult()) return false;
             if (existing.task && existing.task.task_id === task.task_id) return true;
         }
-        if (!ackWechatActionTask(task)) return false;
+        // 兼容手工构造/旧动作入口；正常统一任务已在领取函数内完成 ACK。
+        if (task.acknowledged_on_claim !== true && !ackWechatActionTask(task)) return false;
         const deviceOnlyTask = task.action_type === 'device_sleep' || task.action_type === 'device_wake';
         const accountLoginTask = task.action_type === 'account_login';
         const switchAccountTask = task.action_type === 'switch_account';
@@ -634,6 +648,22 @@ function processWechatAction(task) {
         try { releaseNode(); } catch (ignoreRelease) {}
         config.pauseResultWatcher = false;
         config.actionInProgress = false;
+    }
+}
+
+function pollAndProcessWechatAction() {
+    const task = getWechatActionTask();
+    if (!task) return false;
+    try {
+        logi('开始微信动作: ' + task.task_id + ' / ' + task.action_type);
+        return processWechatAction(task);
+    } catch (handoffError) {
+        // processWechatAction 自身有保护；这里仍保留最外层交接审计，确保以后
+        // 再出现“领取了但没有进入处理”的问题时服务器能看到准确阶段。
+        loge('统一任务领取后交接失败: ' + handoffError);
+        queuePhoneAudit(task, 'action_handoff_failed', 'handoff', 'error',
+            {action_type: task.action_type, error: '' + handoffError});
+        return false;
     }
 }
 
@@ -1224,6 +1254,7 @@ function saoma(taskId, taskDeadline) {
     let scanAttemptStartTime = 0; // 本轮点击相册的起点；授权控件出现或点击后也不能清零
     let lastAuthorizationActionTime = 0; // 授权控件点击节流，防止卡页时连续点击
     let authorizationPageLogged = false;
+    let phoneOptionSelected = false; // 微信原生手机号授权页的号码选项每轮最多选择一次
     let recoveryCount = 0;
     while (time() < scanDeadline) {
         if ( config.step!==4) return -999
@@ -1232,14 +1263,14 @@ function saoma(taskId, taskDeadline) {
         // 后台线程只负责发现结果，重启微信和重扫必须由主线程执行，避免节点锁竞态。
         if (config.validationFailurePending) {
             config.validationFailurePending = false;
-            recoveryCount++;
-            if (recoveryCount > maxRecoveryCount) {
+            if (recoveryCount >= maxRecoveryCount) {
                 loge('验证失败，已达到自动恢复上限');
                 upStepLog(taskId, 'saoma', '验证失败，自动恢复已达上限' + maxRecoveryCount + '次', 'error');
                 config.scanFailureReason = '验证失败，自动恢复' + maxRecoveryCount + '次后仍失败';
                 retVal = 0;
                 break;
             }
+            recoveryCount++;
             logw('检测到验证失败，开始第' + recoveryCount + '次自动恢复');
             upStepLog(taskId, 'saoma', '检测到验证失败，自动恢复第' + recoveryCount + '次', 'warn');
             if (!recoverScanMiniProgram('验证失败自动恢复', taskId)) {
@@ -1253,6 +1284,7 @@ function saoma(taskId, taskDeadline) {
             scanAttemptStartTime = 0;
             lastAuthorizationActionTime = 0;
             authorizationPageLogged = false;
+            phoneOptionSelected = false;
             continue;
         }
         keepScreen();
@@ -1270,23 +1302,45 @@ function saoma(taskId, taskDeadline) {
                     upStepLog(taskId, 'saoma', '检测到手机号授权弹窗'); // 步骤日志L11
                     authorizationPageLogged = true;
                 }
-                if (jc.FindNode(textMatch('^(微信绑定号码|上次提供)$'))) {
-                    if (time() - lastAuthorizationActionTime >= 4000) {
-                        logd('点击: ' + j_node.text);
-                    humanizedNodeClick(j_node);
-                        lastAuthorizationActionTime = time();
-                        upStepLog(taskId, 'saoma', '已点击授权手机号，等待验证结果'); // 步骤日志L12
-                        sleep(2000);
+                if (time() - lastAuthorizationActionTime >= 2500) {
+                    // 这是两步页面：先选择号码来源，再点最终“允许/确认”。1.58
+                    // 只反复点击“微信绑定号码/上次提供”，所以弹窗一直不消失。
+                    if (!phoneOptionSelected &&
+                            jc.FindNode(textMatch('^(微信绑定号码|上次提供|使用微信绑定手机号)$'))) {
+                        const optionText = '' + (j_node.text || '手机号选项');
+                        const selected = humanizedNodeClick(j_node) === true;
+                        if (selected) {
+                            phoneOptionSelected = true;
+                            lastAuthorizationActionTime = time();
+                            upStepLog(taskId, 'saoma', '已选择手机号来源: ' + optionText);
+                            sleep(1200);
+                        } else {
+                            upStepLog(taskId, 'saoma', '手机号来源节点点击失败，等待重试', 'warn');
+                        }
+                    } else if (jc.FindNode(textMatch(
+                            '^(允许|同意|确认|授权|确认授权|使用该手机号|确认并继续)$'))) {
+                        const confirmText = '' + (j_node.text || '确认授权');
+                        const confirmed = humanizedNodeClick(j_node) === true;
+                        if (confirmed) {
+                            lastAuthorizationActionTime = time();
+                            upStepLog(taskId, 'saoma', '已点击最终授权按钮: ' + confirmText); // 步骤日志L12
+                            sleep(2500);
+                        } else {
+                            upStepLog(taskId, 'saoma', '最终授权按钮点击失败，等待重试', 'warn');
+                        }
                     }
                 }
-            } else if (jc.FindNode(text('请授权获取手机号进行验证 '))) {
+            } else if (jc.FindNode(textMatch('请授权获取手机号进行验证'))) {
                 if (scanAttemptStartTime === 0) scanAttemptStartTime = time();
                 if (time() - lastAuthorizationActionTime >= 4000) {
-                    logd('点击: ' + j_node.text);
-                    humanizedNodeClick(j_node);
-                    lastAuthorizationActionTime = time();
-                    upStepLog(taskId, 'saoma', '已点击备用授权提示，等待验证结果', 'warn');
-                    sleep(3000);
+                    const clickedPrompt = humanizedNodeClick(j_node) === true;
+                    if (clickedPrompt) {
+                        lastAuthorizationActionTime = time();
+                        upStepLog(taskId, 'saoma', '已点击小程序手机号授权入口，等待微信授权弹窗');
+                        sleep(2500);
+                    } else {
+                        upStepLog(taskId, 'saoma', '小程序手机号授权入口点击失败，等待重试', 'warn');
+                    }
                 }
             } else if (jc.FindNode(text('解锁'))) {
                 if (scanAttemptStartTime === 0) scanAttemptStartTime = time();
@@ -1302,20 +1356,26 @@ function saoma(taskId, taskDeadline) {
                 if (scanAttemptStartTime === 0) scanAttemptStartTime = time();
                 if (time() - lastAuthorizationActionTime >= 4000) {
                     logd('点击: 授权手机号');
-                    humanizedPointClick(gPoint.x, gPoint.y, 5)
-                    lastAuthorizationActionTime = time();
-                    upStepLog(taskId, 'saoma', '已通过图片识别点击授权手机号，等待验证结果', 'warn');
-                    sleep(3000);
+                    if (humanizedPointClick(gPoint.x, gPoint.y, 5) === true) {
+                        lastAuthorizationActionTime = time();
+                        upStepLog(taskId, 'saoma', '已通过图片识别点击授权控件，等待页面变化', 'warn');
+                        sleep(2500);
+                    } else {
+                        upStepLog(taskId, 'saoma', '图片授权控件点击失败，等待重试', 'warn');
+                    }
                 }
             } else if (findImage('解锁按钮', 414, 1300, 620, 1372)) {
                 //这个是对上面的补充，上面节点有时候找不到
                 if (scanAttemptStartTime === 0) scanAttemptStartTime = time();
                 if (time() - lastAuthorizationActionTime >= 4000) {
                     logd('点击: 解锁(图像识别)');
-                    humanizedPointClick(gPoint.x, gPoint.y, 5)
-                    lastAuthorizationActionTime = time();
-                    upStepLog(taskId, 'saoma', '已通过图片识别点击解锁，等待验证结果', 'warn');
-                    sleep(3000);
+                    if (humanizedPointClick(gPoint.x, gPoint.y, 5) === true) {
+                        lastAuthorizationActionTime = time();
+                        upStepLog(taskId, 'saoma', '已通过图片识别点击解锁，等待验证结果', 'warn');
+                        sleep(3000);
+                    } else {
+                        upStepLog(taskId, 'saoma', '图片解锁按钮点击失败，等待重试', 'warn');
+                    }
                 }
             } else if (jc.FindNode(text('拍摄照片'))) {
                 logd('到达扫码界面');
@@ -1404,15 +1464,15 @@ function saoma(taskId, taskDeadline) {
         }
         // 从点击相册开始计时。识别到或点击了授权控件也不能取消保护，必须等到后台确认成功/失败。
         if (scanAttemptStartTime > 0 && time() - scanAttemptStartTime > scanAttemptTimeout) {
-            recoveryCount++;
-            logw('扫码授权或验证25秒无结果，第' + recoveryCount + '次自动恢复');
-            upStepLog(taskId, 'saoma', '扫码授权或验证无结果，自动恢复第' + recoveryCount + '次', 'warn'); // 步骤日志L13
-            if (recoveryCount > maxRecoveryCount) {
+            if (recoveryCount >= maxRecoveryCount) {
                 loge('扫码授权或验证无结果，已达到自动恢复上限');
                 config.scanFailureReason = '扫码授权或验证无结果，自动恢复' + maxRecoveryCount + '次后仍失败';
                 retVal = 0;
                 break;
             }
+            recoveryCount++;
+            logw('扫码授权或验证25秒无结果，第' + recoveryCount + '次自动恢复');
+            upStepLog(taskId, 'saoma', '扫码授权或验证无结果，自动恢复第' + recoveryCount + '次', 'warn'); // 步骤日志L13
             if (!recoverScanMiniProgram('扫码授权或验证无结果', taskId)) {
                 loge('扫码无结果后恢复小程序失败');
                 upStepLog(taskId, 'saoma', '扫码无结果且恢复小程序失败', 'error');
@@ -1424,6 +1484,7 @@ function saoma(taskId, taskDeadline) {
             scanAttemptStartTime = 0;
             lastAuthorizationActionTime = 0;
             authorizationPageLogged = false;
+            phoneOptionSelected = false;
         }
         image.recycleAllImage()
         sleep(800);
@@ -1648,11 +1709,7 @@ function main() {
                 taskConfig = getScan(config.deviceId);
                 if (!taskConfig) {
                     // 扫码永远优先；确认当前没有扫码任务后才领取低优先级微信动作。
-                    const actionTask = getWechatActionTask();
-                    if (actionTask) {
-                        logi('开始微信动作: ' + actionTask.task_id + ' / ' + actionTask.action_type);
-                        processWechatAction(actionTask);
-                    }
+                    pollAndProcessWechatAction();
                     sleep(3000);
                     break;
                 }
