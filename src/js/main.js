@@ -36,6 +36,39 @@ function humanizedNodeClick(node) {
     return false;
 }
 
+function clickNativePhoneAuthorizationCard() {
+    // 部分微信版本会暴露手机号或“上次提供”节点；手机号卡片本身就是
+    // 最终授权动作，不存在后续“允许/确认”按钮。
+    if (jc.FindNode(textMatch(
+            '^(\\d{3}\\*+\\d{4}|微信绑定号码|上次提供|使用微信绑定手机号)$'))) {
+        if (humanizedNodeClick(j_node) === true) return true;
+    }
+
+    // 当前真机的微信原生底部面板不提供任何无障碍节点。调用方已经通过
+    // 唯一标题确认授权面板，这里再验证手机号卡片的白色区域，坐标回退
+    // 只能落在卡片中央安全区，绝不能碰到下方“不允许”。
+    const width = device.getScreenWidth();
+    const height = device.getScreenHeight();
+    const left = ~~(width * 0.10);
+    const top = ~~(height * 0.605);
+    const right = ~~(width * 0.90);
+    const bottom = ~~(height * 0.685);
+    let whitePoints = null;
+    try {
+        whitePoints = image.findColor(
+            gScreen, '#ffffff', 0.96, left, top, right, bottom, 4, 1
+        );
+    } catch (visualError) {
+        logw('手机号卡片视觉验证异常: ' + visualError);
+    }
+    if (!whitePoints || whitePoints.length < 4) return false;
+    return humanizedPointClick(
+        random(~~(width * 0.38), ~~(width * 0.62)),
+        random(~~(height * 0.635), ~~(height * 0.655)),
+        3
+    ) === true;
+}
+
 let config = {
     scX: ~~device.getScreenWidth(),
     scY: ~~device.getScreenHeight(),
@@ -236,6 +269,10 @@ function getScan(deviceId) {
                     // 服务端活跃任务窗口为5分钟，手机端预留约30秒给最终结果上报。
                     taskDeadline: time() + 270000
                 }
+            } else if (ret.success && ret.registration_required === true) {
+                config.stepZeroReason = 'server_requested_reregistration';
+                config.step = 0;
+                logw('服务器要求重新注册，自动返回注册步骤');
             } else {
                 logd('没有任务');
                 // toast('没有任务');
@@ -1254,7 +1291,7 @@ function saoma(taskId, taskDeadline) {
     let scanAttemptStartTime = 0; // 本轮点击相册的起点；授权控件出现或点击后也不能清零
     let lastAuthorizationActionTime = 0; // 授权控件点击节流，防止卡页时连续点击
     let authorizationPageLogged = false;
-    let phoneOptionSelected = false; // 微信原生手机号授权页的号码选项每轮最多选择一次
+    let phoneAuthorizationAttempts = 0; // 原生手机号卡片是最终授权，每轮最多点击2次
     let recoveryCount = 0;
     while (time() < scanDeadline) {
         if ( config.step!==4) return -999
@@ -1284,7 +1321,7 @@ function saoma(taskId, taskDeadline) {
             scanAttemptStartTime = 0;
             lastAuthorizationActionTime = 0;
             authorizationPageLogged = false;
-            phoneOptionSelected = false;
+            phoneAuthorizationAttempts = 0;
             continue;
         }
         keepScreen();
@@ -1303,30 +1340,18 @@ function saoma(taskId, taskDeadline) {
                     authorizationPageLogged = true;
                 }
                 if (time() - lastAuthorizationActionTime >= 2500) {
-                    // 这是两步页面：先选择号码来源，再点最终“允许/确认”。1.58
-                    // 只反复点击“微信绑定号码/上次提供”，所以弹窗一直不消失。
-                    if (!phoneOptionSelected &&
-                            jc.FindNode(textMatch('^(微信绑定号码|上次提供|使用微信绑定手机号)$'))) {
-                        const optionText = '' + (j_node.text || '手机号选项');
-                        const selected = humanizedNodeClick(j_node) === true;
-                        if (selected) {
-                            phoneOptionSelected = true;
+                    if (phoneAuthorizationAttempts < 2) {
+                        const submitted = clickNativePhoneAuthorizationCard() === true;
+                        if (submitted) {
+                            phoneAuthorizationAttempts++;
                             lastAuthorizationActionTime = time();
-                            upStepLog(taskId, 'saoma', '已选择手机号来源: ' + optionText);
-                            sleep(1200);
+                            upStepLog(taskId, 'saoma',
+                                '已点击手机号卡片并提交最终授权，第' +
+                                phoneAuthorizationAttempts + '次'); // 步骤日志L12
+                            sleep(3000);
                         } else {
-                            upStepLog(taskId, 'saoma', '手机号来源节点点击失败，等待重试', 'warn');
-                        }
-                    } else if (jc.FindNode(textMatch(
-                            '^(允许|同意|确认|授权|确认授权|使用该手机号|确认并继续)$'))) {
-                        const confirmText = '' + (j_node.text || '确认授权');
-                        const confirmed = humanizedNodeClick(j_node) === true;
-                        if (confirmed) {
-                            lastAuthorizationActionTime = time();
-                            upStepLog(taskId, 'saoma', '已点击最终授权按钮: ' + confirmText); // 步骤日志L12
-                            sleep(2500);
-                        } else {
-                            upStepLog(taskId, 'saoma', '最终授权按钮点击失败，等待重试', 'warn');
+                            upStepLog(taskId, 'saoma',
+                                '手机号卡片节点和视觉区域均未验证，等待重试', 'warn');
                         }
                     }
                 }
@@ -1395,6 +1420,7 @@ function saoma(taskId, taskDeadline) {
                             scanAttemptStartTime = time();
                             lastAuthorizationActionTime = 0;
                             authorizationPageLogged = false;
+                            phoneAuthorizationAttempts = 0;
                             upStepLog(taskId, 'saoma', '已点击相册图片，等待授权及验证结果'); // 步骤日志L10
                             sleep(5000)
                         }
@@ -1484,7 +1510,7 @@ function saoma(taskId, taskDeadline) {
             scanAttemptStartTime = 0;
             lastAuthorizationActionTime = 0;
             authorizationPageLogged = false;
-            phoneOptionSelected = false;
+            phoneAuthorizationAttempts = 0;
         }
         image.recycleAllImage()
         sleep(800);
@@ -1708,6 +1734,11 @@ function main() {
                 flushPhoneAuditLogs();
                 taskConfig = getScan(config.deviceId);
                 if (!taskConfig) {
+                    if (config.step === 0) {
+                        // 服务端明确要求重新注册时，当前轮不能继续领取统一动作。
+                        sleep(500);
+                        break;
+                    }
                     // 扫码永远优先；确认当前没有扫码任务后才领取低优先级微信动作。
                     pollAndProcessWechatAction();
                     sleep(3000);
