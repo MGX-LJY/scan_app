@@ -114,6 +114,11 @@ function typeTextCharacterByCharacter(editorFactory, value, deadline, shouldPree
     let typed = '';
     let applied = false;
     let verified = false;
+    let inputAttempt = 0;
+    let attemptsUsed = 0;
+    let appliedAny = false;
+    let observedText = '';
+    let lastInputError = '';
     while (offset < content.length) {
         if ((deadline && time() + 1500 >= deadline) ||
             (shouldPreempt && shouldPreempt())) {
@@ -126,25 +131,53 @@ function typeTextCharacterByCharacter(editorFactory, value, deadline, shouldPree
         // 不把 emoji 等 UTF-16 代理对拆成两个无效字符。
         if (code >= 0xD800 && code <= 0xDBFF && next < content.length) next++;
         prefix = content.substring(0, next);
-        applied = false;
-        try {
-            editor = editorFactory();
-            if (editor && editor.visible) applied = !!editor.inputText(prefix);
-        } catch (inputError) {
-            runtime.lastTextInputFailure = {stage: 'input', prefix_length: next,
-                expected_length: content.length, error: String(inputError)};
-        } finally {
-            releaseNode();
+        verified = false;
+        attemptsUsed = 0;
+        appliedAny = false;
+        observedText = '';
+        lastInputError = '';
+        // 微信输入框偶尔在键盘/候选栏刷新时短暂丢失节点或延迟回显。
+        // 同一个前缀最多重试3次；每次都重新抓节点，绝不持有旧 NodeInfo。
+        for (inputAttempt = 1; inputAttempt <= 3 && !verified; inputAttempt++) {
+            attemptsUsed = inputAttempt;
+            if ((deadline && time() + 900 >= deadline) ||
+                (shouldPreempt && shouldPreempt())) {
+                runtime.lastTextInputFailure = {stage: 'interrupted', prefix_length: offset,
+                    expected_length: content.length, expected_prefix: prefix,
+                    attempts: attemptsUsed};
+                return false;
+            }
+            applied = false;
+            try {
+                editor = editorFactory();
+                if (editor && editor.visible) {
+                    observedText = String(editor.text || '');
+                    if (observedText === prefix) verified = true;
+                    else applied = !!editor.inputText(prefix);
+                }
+            } catch (inputError) {
+                lastInputError = String(inputError);
+            } finally {
+                releaseNode();
+            }
+            if (verified) break;
+            if (applied) appliedAny = true;
+            // inputText 的布尔值在节点刷新边界并不总可靠，以重新获取节点后的文本为准。
+            verified = waitFor(function () {
+                return withNode(editorFactory, function (freshEditor) {
+                    observedText = freshEditor && freshEditor.visible ?
+                        String(freshEditor.text || '') : '';
+                    return freshEditor.visible && observedText === prefix;
+                });
+            }, applied ? 1050 + inputAttempt * 180 : 1450 + inputAttempt * 220, 120);
+            if (!verified && inputAttempt < 3) humanPause(140, 420);
         }
-        // inputText 的布尔值在节点刷新边界并不总可靠，以重新获取节点后的文本为准。
-        verified = waitFor(function () {
-            return withNode(editorFactory, function (freshEditor) {
-                return freshEditor.visible && String(freshEditor.text || '') === prefix;
-            });
-        }, applied ? 900 : 1400, 120);
         if (!verified) {
             runtime.lastTextInputFailure = {stage: 'verify_prefix', prefix_length: next,
-                expected_length: content.length, input_returned: applied};
+                expected_length: content.length, attempts: attemptsUsed,
+                input_returned: appliedAny, expected_prefix: prefix,
+                observed_text: observedText, observed_length: observedText.length,
+                last_input_error: lastInputError || null};
             return false;
         }
         typed = content.substring(offset, next);
@@ -528,29 +561,41 @@ function clearChatDraft() {
 }
 
 function sendText(payload, deadline, shouldPreempt) {
-    if (!payload.confirm_external || !openContact(payload.contact, deadline) || !switchToKeyboardMode(deadline)) {
-        return {success: false, error: '未授权发送或无法打开联系人'};
-    }
+    if (!payload.confirm_external) return {success: false, error: '未授权发送'};
+    if (!openContact(payload.contact, deadline)) return {success: false,
+        result: {contact_failure: runtime.lastContactFailure}, error: '无法打开联系人'};
+    if (!switchToKeyboardMode(deadline)) return {success: false,
+        result: {input_failure: {stage: 'keyboard_mode'}}, error: '无法切换到文字输入'};
     const chatEditorFactory = function () {
         return id('com.tencent.mm:id/bkk').clz('android.widget.EditText').pkg(WX_PACKAGE).getOneNodeInfo(800);
     };
     const prepared = typeTextCharacterByCharacter(chatEditorFactory, payload.content,
         deadline, shouldPreempt);
     if (!prepared) {
+        const inputFailure = runtime.lastTextInputFailure;
         clearChatDraft();
         if (shouldPreempt && shouldPreempt()) {
             return {success: false, preempted: true, error: '扫码任务抢占'};
         }
-        return {success: false, error: '消息逐字输入失败'};
+        return {success: false, result: {input_failure: inputFailure},
+            error: '消息逐字输入失败'};
     }
+    let finalObservedText = '';
     const contentReady = waitFor(function () {
         return withNode(function () {
             return id('com.tencent.mm:id/bkk').clz('android.widget.EditText').pkg(WX_PACKAGE).getOneNodeInfo(300);
-        }, function (input) { return (input.text || '') === payload.content; });
+        }, function (input) {
+            finalObservedText = String(input.text || '');
+            return finalObservedText === payload.content;
+        });
     }, 1800, 250);
     if (!contentReady) {
         clearChatDraft();
-        return {success: false, error: '消息输入内容校验失败'};
+        return {success: false, result: {input_failure: {stage: 'final_verify',
+            expected_length: String(payload.content || '').length,
+            observed_length: finalObservedText.length,
+            expected_text: String(payload.content || ''), observed_text: finalObservedText}},
+            error: '消息输入内容校验失败'};
     }
     if (shouldPreempt && shouldPreempt()) {
         clearChatDraft();
