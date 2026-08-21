@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":171,
+"version":172,
 "dialog":false,
-"msg": "修复语音通话拨打接听状态机",
+"msg": "修复双端通话接通识别与按时挂机",
 "force": true,
-"md5":"14cf39a7b26cee81766921cf53fceb86",
+"md5":"3196d0214a562217852bb7854ac87cb4",
 "download_timeout":300
 }
