@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":168,
+"version":169,
 "dialog":false,
-"msg": "修复逐字输入偶发失败并补充精确诊断",
+"msg": "修复表情已发送却被误判失败的问题",
 "force": true,
-"md5":"7caad27452eaf7da0e14a4c4eee3f898",
+"md5":"5203fb226b87bf9e67ed9f32c62ec211",
 "download_timeout":300
 }
