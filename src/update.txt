@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":166,
+"version":167,
 "dialog":false,
-"msg": "修复视频号长时停留、页面识别及联系人逐字搜索",
+"msg": "修复双端通话接听、抢占原因与未成年人提示",
 "force": true,
-"md5":"aa694b3a1bf3641c096a507e5459bb76",
+"md5":"6bd0046e87f9a173b337e2b70dd15399",
 "download_timeout":300
 }
