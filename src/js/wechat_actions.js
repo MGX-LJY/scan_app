@@ -617,6 +617,10 @@ function sendEmoji(payload, deadline, shouldPreempt) {
     if (!openChatForMedia(payload, deadline) || !switchToKeyboardMode(deadline)) {
         return {success: false, error: '未授权发送或无法打开联系人'};
     }
+    // 必须在打开表情面板前记录聊天消息基线。面板本身也包含 desc="[微笑]"
+    // 一类节点；若在面板打开后取基线，发送后面板节点消失、消息气泡出现，
+    // 数量可能不变，进而把已经发送成功的表情误判为失败。
+    const beforeXml = wechatXmlSnapshot();
     // 先打开表情面板，再按无障碍描述精确选择；不会用屏幕固定坐标。
     const opened = retryFreshNode('open_emoji_panel', function () {
         return desc('表情').pkg(WX_PACKAGE).getOneNodeInfo(700);
@@ -630,7 +634,6 @@ function sendEmoji(payload, deadline, shouldPreempt) {
     sleep(random(550, 1800));
     const normalizedDescription = String(payload.description || '').replace(/^\[|\]$/g, '');
     if (!normalizedDescription) return {success: false, error: '表情描述不能为空'};
-    const beforeXml = wechatXmlSnapshot();
     const selected = retryFreshNode('select_emoji', function () {
         return desc('[' + normalizedDescription + ']').pkg(WX_PACKAGE).getOneNodeInfo(500) ||
             desc(normalizedDescription).pkg(WX_PACKAGE).getOneNodeInfo(300);
