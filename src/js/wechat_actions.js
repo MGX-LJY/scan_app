@@ -7,7 +7,9 @@ const WX_PAGE = {
 };
 const runtime = {
     currentChatContact: null,
-    chatVerifiedAt: 0
+    chatVerifiedAt: 0,
+    lastTextInputFailure: null,
+    lastContactFailure: null
 };
 
 function wechatXmlSnapshot() {
@@ -80,27 +82,86 @@ function humanPause(minMs, maxMs) {
 
 // EasyClick 的 inputText 本质上是一次性设置文本。这里逐步设置不断增长的
 // 前缀，让微信输入框表现为逐字输入；不使用剪贴板，也不一次灌入整段文字。
-function typeTextCharacterByCharacter(editor, value, deadline, shouldPreempt) {
+// 搜索框输入首字符后会重建结果页和 EditText，因此每个字符都重新获取节点，
+// 并从新节点核验完整前缀，禁止继续使用首轮已经失效的 NodeInfo。
+function typeTextCharacterByCharacter(editorFactory, value, deadline, shouldPreempt) {
     const content = String(value || '');
-    if (!editor || !content) return false;
-    editor.clearText();
+    if (typeof editorFactory !== 'function' || !content) return false;
+    runtime.lastTextInputFailure = null;
+    let editor = null;
+    let cleared = false;
+    try {
+        editor = editorFactory();
+        if (editor && editor.visible) {
+            clickNodeSafeArea(editor);
+            editor.clearText();
+            cleared = true;
+        }
+    } catch (clearError) {
+        runtime.lastTextInputFailure = {stage: 'clear', error: String(clearError)};
+    } finally {
+        releaseNode();
+    }
+    if (!cleared) {
+        if (!runtime.lastTextInputFailure) runtime.lastTextInputFailure = {stage: 'clear'};
+        return false;
+    }
     let offset = 0;
+    // DEX/Rhino 在部分真机会复用 while 块内声明的首轮词法变量；统一在循环外声明。
+    let next = 0;
+    let code = 0;
+    let prefix = '';
+    let typed = '';
+    let applied = false;
+    let verified = false;
     while (offset < content.length) {
         if ((deadline && time() + 1500 >= deadline) ||
-            (shouldPreempt && shouldPreempt())) return false;
-        let next = offset + 1;
-        const code = content.charCodeAt(offset);
+            (shouldPreempt && shouldPreempt())) {
+            runtime.lastTextInputFailure = {stage: 'interrupted', prefix_length: offset,
+                expected_length: content.length};
+            return false;
+        }
+        next = offset + 1;
+        code = content.charCodeAt(offset);
         // 不把 emoji 等 UTF-16 代理对拆成两个无效字符。
         if (code >= 0xD800 && code <= 0xDBFF && next < content.length) next++;
-        const prefix = content.substring(0, next);
-        if (!editor.inputText(prefix)) return false;
-        const typed = content.substring(offset, next);
+        prefix = content.substring(0, next);
+        applied = false;
+        try {
+            editor = editorFactory();
+            if (editor && editor.visible) applied = !!editor.inputText(prefix);
+        } catch (inputError) {
+            runtime.lastTextInputFailure = {stage: 'input', prefix_length: next,
+                expected_length: content.length, error: String(inputError)};
+        } finally {
+            releaseNode();
+        }
+        // inputText 的布尔值在节点刷新边界并不总可靠，以重新获取节点后的文本为准。
+        verified = waitFor(function () {
+            return withNode(editorFactory, function (freshEditor) {
+                return freshEditor.visible && String(freshEditor.text || '') === prefix;
+            });
+        }, applied ? 900 : 1400, 120);
+        if (!verified) {
+            runtime.lastTextInputFailure = {stage: 'verify_prefix', prefix_length: next,
+                expected_length: content.length, input_returned: applied};
+            return false;
+        }
+        typed = content.substring(offset, next);
         if (/[,，。！？!?；;…\n]/.test(typed)) humanPause(260, 720);
         else humanPause(75, 260);
         if (random(0, 14) === 0) humanPause(280, 850);
         offset = next;
     }
     return true;
+}
+
+function failContactNavigation(stage, contact) {
+    runtime.lastContactFailure = {stage: stage, contact: String(contact || ''),
+        page: detectWechatPage(), text_input: runtime.lastTextInputFailure};
+    logw('联系人导航失败 stage=' + stage + ' contact=' + contact +
+        ' detail=' + JSON.stringify(runtime.lastContactFailure));
+    return false;
 }
 
 function humanizedPointClick(x, y, radius) {
@@ -269,7 +330,7 @@ function detectWechatPage() {
     if (attr('text', '保留此次编辑？') || attr('text', '保留此次编辑?')) return WX_PAGE.MOMENT_EDITOR;
     if (attr('id', 'com.tencent.mm:id/n7y')) return WX_PAGE.MOMENT_EDITOR;
     if (attr('desc', '拍照分享') && attr('id', 'com.tencent.mm:id/actionbar_up_indicator')) return WX_PAGE.MOMENTS;
-    if (attr('desc', '关注') && attr('desc', '推荐')) return WX_PAGE.CHANNELS;
+    if (channelsPageEvidence(xml).matched) return WX_PAGE.CHANNELS;
     if (attr('desc', '键盘') && (attr('desc', '表情') || attr('text', '所有表情'))) return WX_PAGE.CHAT_EMOJI;
     if (attr('desc', '切换到键盘') && (attr('text', '按住 说话') || attr('text', '按住说话'))) return WX_PAGE.CHAT_VOICE;
     if ((attr('desc', '切换到按住说话') || attr('id', 'com.tencent.mm:id/bkk')) &&
@@ -332,7 +393,9 @@ function openContact(contact, deadline) {
         return true;
     }
     runtime.currentChatContact = null;
-    if (!mainTab('微信', deadline)) return false;
+    runtime.lastContactFailure = null;
+    runtime.lastTextInputFailure = null;
+    if (!mainTab('微信', deadline)) return failContactNavigation('main_tab', contact);
     let searchReady = false;
     for (let searchAttempt = 1; searchAttempt <= 3 && !searchReady; searchAttempt++) {
         const clickedSearch = retryFreshNode('open_search_' + searchAttempt, function () {
@@ -346,26 +409,26 @@ function openContact(contact, deadline) {
         }, 1600, 200);
         if (!searchReady) sleep(random(300, 700));
     }
-    if (!searchReady) return false;
-    if (!retryFreshNode('search_contact_input', function () {
+    if (!searchReady) return failContactNavigation('search_open', contact);
+    const searchEditorFactory = function () {
         return id('com.tencent.mm:id/d98').pkg(WX_PACKAGE).getOneNodeInfo(700);
-    }, function (input) {
-        clickNodeSafeArea(input);
-        return typeTextCharacterByCharacter(input, contact, deadline, null);
-    }, 3, 500, deadline)) return false;
+    };
+    if (!typeTextCharacterByCharacter(searchEditorFactory, contact, deadline, null)) {
+        return failContactNavigation('search_input', contact);
+    }
     const queryVerified = waitFor(function () {
         return withNode(function () {
             return id('com.tencent.mm:id/d98').pkg(WX_PACKAGE).getOneNodeInfo(300);
         }, function (input) { return (input.text || '').indexOf(contact) >= 0; });
     }, 1800, 250);
-    if (!queryVerified) return false;
+    if (!queryVerified) return failContactNavigation('search_query_verify', contact);
     sleep(random(900, 1900));
     if (!retryFreshNode('open_contact_result', function () {
         const nodes = id('com.tencent.mm:id/odf').pkg(WX_PACKAGE).getNodeInfo(700);
         if (!nodes) return null;
         for (let i = 0; i < nodes.length; i++) if (nodes[i].visible && nodes[i].text === contact) return nodes[i];
         return null;
-    }, clickVerifiedNode, 3, 650, deadline)) return false;
+    }, clickVerifiedNode, 3, 650, deadline)) return failContactNavigation('search_result', contact);
     const opened = waitFor(function () {
         if (isChatPage()) return true;
         // 搜索结果偶尔先进入资料页，明确点击“发消息”后再校验聊天输入框。
@@ -376,8 +439,9 @@ function openContact(contact, deadline) {
     if (opened) {
         runtime.currentChatContact = contact;
         runtime.chatVerifiedAt = time();
+        runtime.lastContactFailure = null;
     }
-    return opened;
+    return opened || failContactNavigation('chat_open_verify', contact);
 }
 
 function inspectChat(payload, deadline) {
@@ -467,12 +531,11 @@ function sendText(payload, deadline, shouldPreempt) {
     if (!payload.confirm_external || !openContact(payload.contact, deadline) || !switchToKeyboardMode(deadline)) {
         return {success: false, error: '未授权发送或无法打开联系人'};
     }
-    const prepared = retryFreshNode('prepare_text', function () {
+    const chatEditorFactory = function () {
         return id('com.tencent.mm:id/bkk').clz('android.widget.EditText').pkg(WX_PACKAGE).getOneNodeInfo(800);
-    }, function (input) {
-        clickNodeSafeArea(input);
-        return typeTextCharacterByCharacter(input, payload.content, deadline, shouldPreempt);
-    }, 3, 450, deadline);
+    };
+    const prepared = typeTextCharacterByCharacter(chatEditorFactory, payload.content,
+        deadline, shouldPreempt);
     if (!prepared) {
         clearChatDraft();
         if (shouldPreempt && shouldPreempt()) {
@@ -719,7 +782,8 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
     const isVideo = callType === 'video';
     const callLabel = isVideo ? '视频通话' : '语音通话';
     if (payload.confirm_external !== true) return {success: false, error: callLabel + '未明确授权'};
-    if (!openContact(payload.contact, taskDeadline)) return {success: false, error: '无法打开联系人'};
+    if (!openContact(payload.contact, taskDeadline)) return {success: false,
+        result: {contact_navigation: runtime.lastContactFailure}, error: '无法打开联系人'};
     const keyboardRaised = withNode(function () {
         return id('com.tencent.mm:id/bkk').pkg(WX_PACKAGE).getOneNodeInfo(350);
     }, function (input) {
@@ -907,10 +971,34 @@ function openDiscoverItem(item, deadline) {
         clickVerifiedNode, 3, 500, deadline);
 }
 
+function channelsPageEvidence(xmlSnapshot) {
+    const xml = xmlSnapshot === undefined ? wechatXmlSnapshot() : (xmlSnapshot || '');
+    const activity = runningWechatActivity();
+    const foreground = isWechatForeground(xml);
+    const hasFollowing = xml.indexOf('desc="关注"') >= 0;
+    const hasRecommend = xml.indexOf('desc="推荐"') >= 0;
+    const hasBack = xml.indexOf('id="com.tencent.mm:id/backBtn"') >= 0;
+    const hasLike = xml.indexOf('id="com.tencent.mm:id/ng5"') >= 0;
+    // 视频加载、广告或标签收起时，不一定同时暴露“关注/推荐”。
+    // FinderHomeAffinityUI 是视频号首页的强证据；节点树可用时仍使用成对证据。
+    const finderHomeActivity = activity.indexOf('FinderHomeAffinityUI') >= 0;
+    const matched = foreground && (finderHomeActivity ||
+        (hasFollowing && hasRecommend) || (hasBack && hasLike));
+    return {matched: matched, foreground: foreground, activity: activity,
+        finder_home_activity: finderHomeActivity, has_following: hasFollowing,
+        has_recommend: hasRecommend, has_back: hasBack, has_like: hasLike};
+}
+
+function channelsValidationResult(stage) {
+    const evidence = channelsPageEvidence();
+    return {stage: stage, matched: evidence.matched, foreground: evidence.foreground,
+        activity: evidence.activity, finder_home_activity: evidence.finder_home_activity,
+        has_following: evidence.has_following, has_recommend: evidence.has_recommend,
+        has_back: evidence.has_back, has_like: evidence.has_like};
+}
+
 function isChannelsPage() {
-    const xml = wechatXmlSnapshot();
-    if (!isWechatForeground(xml)) return false;
-    return xml.indexOf('desc="关注"') >= 0 && xml.indexOf('desc="推荐"') >= 0;
+    return channelsPageEvidence().matched;
 }
 
 function clickCurrentChannelLike() {
@@ -956,9 +1044,11 @@ function chooseChannelDwellMs(minSeconds, maxSeconds) {
 function browseChannels(payload, shouldPreempt, taskDeadline) {
     const startedAt = time();
     if (!openDiscoverItem('视频号', taskDeadline)) return {success: false, error: '无法进入视频号'};
-    if (!waitFor(isChannelsPage, 6000, 300)) {
+    if (!waitFor(isChannelsPage, 12000, 300)) {
+        const entryValidation = channelsValidationResult('entry');
         clickKnownPageBack(detectWechatPage(), taskDeadline);
-        return {success: false, error: '视频号页面校验失败'};
+        return {success: false, result: {end_reason: 'channels_entry_validation_failed',
+            channels_validation: entryValidation}, error: '视频号页面校验失败'};
     }
     const duration = Math.max(5, Math.min(3600, intOrDefault(payload.duration_seconds, 60)));
     const dwellMin = Math.max(5, Math.min(120, intOrDefault(payload.dwell_min_seconds, 15)));
@@ -981,18 +1071,28 @@ function browseChannels(payload, shouldPreempt, taskDeadline) {
     let totalDwellMs = 0;
     let shortestDwellMs = null;
     let reason = 'duration_complete';
+    let lastValidation = null;
+    // EasyClick DEX/Rhino 在部分真机会复用 while 块内首轮的词法绑定值。
+    // 逐轮计时变量必须在循环外声明，并在每一轮显式重赋值。
+    let dwellStartedAt = 0;
+    let plannedDwellMs = 0;
+    let waitUntil = 0;
+    let actualDwellMs = 0;
+    let wallElapsedMs = 0;
+    let screenWidth = 0;
+    let screenHeight = 0;
     while (time() < deadline && swipes < maxSwipes) {
-        const dwellStartedAt = time();
-        const plannedDwellMs = Math.min(deadline - dwellStartedAt,
+        dwellStartedAt = Number(time());
+        plannedDwellMs = Math.min(deadline - dwellStartedAt,
             chooseChannelDwellMs(dwellMin, dwellMax));
-        const waitUntil = dwellStartedAt + plannedDwellMs;
+        waitUntil = dwellStartedAt + plannedDwellMs;
         while (time() < waitUntil) {
             if (hasSafetyBlocker()) { reason = 'account_attention_required'; break; }
             if (shouldPreempt && shouldPreempt()) { reason = 'scan_preempted'; break; }
             sleep(Math.min(1000, waitUntil - time()));
         }
         if (reason !== 'duration_complete') break;
-        const actualDwellMs = time() - dwellStartedAt;
+        actualDwellMs = Number(time()) - dwellStartedAt;
         // 除任务自然到时外，实际停留不允许明显短于本轮计划。这个守卫可防止
         // 以后框架计时/休眠异常再次退化成每秒连续滑动却被上报为成功。
         if (time() < deadline && actualDwellMs + 500 < plannedDwellMs) {
@@ -1003,6 +1103,12 @@ function browseChannels(payload, shouldPreempt, taskDeadline) {
         totalDwellMs += actualDwellMs;
         shortestDwellMs = shortestDwellMs === null ? actualDwellMs :
             Math.min(shortestDwellMs, actualDwellMs);
+        wallElapsedMs = Number(time()) - Number(startedAt);
+        // 累计停留不可能超过整个动作的墙钟耗时；异常时立即失败，禁止快速滑完。
+        if (totalDwellMs > wallElapsedMs + 1500) {
+            reason = 'dwell_clock_inconsistent';
+            break;
+        }
         if (likes < likeBudget && random(1, 101) <= likeProbability) {
             if (shouldPreempt && shouldPreempt()) { reason = 'scan_preempted'; break; }
             if (isChannelsPage() && clickCurrentChannelLike()) {
@@ -1011,12 +1117,21 @@ function browseChannels(payload, shouldPreempt, taskDeadline) {
             }
         }
         if (time() >= deadline) break;
-        if (!waitFor(isChannelsPage, 1500, 250)) { reason = 'page_changed'; break; }
-        const width = device.getScreenWidth(), height = device.getScreenHeight();
-        swipeToPoint(random(~~(width * 0.43), ~~(width * 0.57)), ~~(height * 0.78),
-            random(~~(width * 0.43), ~~(width * 0.57)), ~~(height * 0.28), random(450, 800));
+        if (!waitFor(isChannelsPage, 4000, 250)) {
+            reason = 'page_changed';
+            lastValidation = channelsValidationResult('before_swipe');
+            break;
+        }
+        screenWidth = device.getScreenWidth();
+        screenHeight = device.getScreenHeight();
+        swipeToPoint(random(~~(screenWidth * 0.43), ~~(screenWidth * 0.57)), ~~(screenHeight * 0.78),
+            random(~~(screenWidth * 0.43), ~~(screenWidth * 0.57)), ~~(screenHeight * 0.28), random(450, 800));
         swipes++;
-        if (!waitFor(isChannelsPage, 2500, 250)) { reason = 'page_changed_after_swipe'; break; }
+        if (!waitFor(isChannelsPage, 5000, 250)) {
+            reason = 'page_changed_after_swipe';
+            lastValidation = channelsValidationResult('after_swipe');
+            break;
+        }
     }
     if (swipes >= maxSwipes && time() < deadline && reason === 'duration_complete') {
         // 调用方显式给出的上限属于正常的有界测试；按时长推导出的上限提前
@@ -1034,6 +1149,9 @@ function browseChannels(payload, shouldPreempt, taskDeadline) {
             planned_duration_seconds: duration, dwell_min_seconds: dwellMin,
             dwell_max_seconds: dwellMax, completed_dwells: completedDwells,
             total_dwell_ms: totalDwellMs, shortest_dwell_ms: shortestDwellMs,
+            wall_elapsed_ms: Number(time()) - Number(startedAt),
+            last_planned_dwell_ms: plannedDwellMs,
+            channels_validation: lastValidation,
             max_swipes: maxSwipes, swipe_limit_source: explicitSwipeLimit ? 'payload' : 'duration'},
         error: success ? null : reason === 'scan_preempted' ? '扫码任务抢占' : '视频号浏览中断: ' + reason};
 }
@@ -1157,13 +1275,12 @@ function postMoment(payload, deadline, shouldPreempt) {
         return {success: false, error: '无法打开纯文字朋友圈编辑器'};
     }
     if (!waitFor(momentEditorVisible, 3500, 250)) return {success: false, error: '朋友圈编辑器页面校验失败'};
-    const prepared = retryFreshNode('prepare_moment_text', function () {
+    const momentEditorFactory = function () {
         return id('com.tencent.mm:id/n7y').pkg(WX_PACKAGE).getOneNodeInfo(700) ||
             clz('android.widget.EditText').pkg(WX_PACKAGE).getOneNodeInfo(300);
-    }, function (editor) {
-        clickNodeSafeArea(editor);
-        return typeTextCharacterByCharacter(editor, payload.content, deadline, shouldPreempt);
-    }, 3, 500, deadline);
+    };
+    const prepared = typeTextCharacterByCharacter(momentEditorFactory, payload.content,
+        deadline, shouldPreempt);
     if (!prepared && shouldPreempt && shouldPreempt()) {
         cancelMomentDraft();
         return {success: false, preempted: true, error: '扫码任务抢占'};
