@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":165,
+"version":166,
 "dialog":false,
-"msg": "修复表情与语音发送校验及来电识别",
+"msg": "修复视频号长时停留、页面识别及联系人逐字搜索",
 "force": true,
-"md5":"28acaf0391ecb45456920c01b632b1bf",
+"md5":"aa694b3a1bf3641c096a507e5459bb76",
 "download_timeout":300
 }
