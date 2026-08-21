@@ -7,6 +7,7 @@ const WX_PAGE = {
 };
 const runtime = {
     currentChatContact: null,
+    currentConversationId: null,
     chatVerifiedAt: 0,
     lastTextInputFailure: null,
     lastContactFailure: null,
@@ -420,13 +421,18 @@ function mainTab(tabName, deadline) {
     return false;
 }
 
-function openContact(contact, deadline) {
+function openContact(contact, deadline, conversationId) {
     if (!contact) return false;
-    if (runtime.currentChatContact === contact && time() - runtime.chatVerifiedAt < 120000 && isChatPage()) {
+    const sameConversation = !!conversationId &&
+        runtime.currentConversationId === String(conversationId);
+    const validForMs = sameConversation ? 2 * 60 * 60 * 1000 : 120000;
+    if (runtime.currentChatContact === contact &&
+            time() - runtime.chatVerifiedAt < validForMs && isChatPage()) {
         runtime.chatVerifiedAt = time();
         return true;
     }
     runtime.currentChatContact = null;
+    runtime.currentConversationId = null;
     runtime.lastContactFailure = null;
     runtime.lastTextInputFailure = null;
     if (!mainTab('微信', deadline)) return failContactNavigation('main_tab', contact);
@@ -472,6 +478,7 @@ function openContact(contact, deadline) {
     }, 5000, 300);
     if (opened) {
         runtime.currentChatContact = contact;
+        runtime.currentConversationId = conversationId ? String(conversationId) : null;
         runtime.chatVerifiedAt = time();
         runtime.lastContactFailure = null;
     }
@@ -479,7 +486,7 @@ function openContact(contact, deadline) {
 }
 
 function inspectChat(payload, deadline) {
-    if (!openContact(payload.contact, deadline) || !isChatPage()) {
+    if (!openContact(payload.contact, deadline, payload.conversation_id) || !isChatPage()) {
         return {success: false, error: '无法进入待核验聊天'};
     }
     sleep(random(500, 1200));
@@ -563,7 +570,7 @@ function clearChatDraft() {
 
 function sendText(payload, deadline, shouldPreempt) {
     if (!payload.confirm_external) return {success: false, error: '未授权发送'};
-    if (!openContact(payload.contact, deadline)) return {success: false,
+    if (!openContact(payload.contact, deadline, payload.conversation_id)) return {success: false,
         result: {contact_failure: runtime.lastContactFailure}, error: '无法打开联系人'};
     if (!switchToKeyboardMode(deadline)) return {success: false,
         result: {input_failure: {stage: 'keyboard_mode'}}, error: '无法切换到文字输入'};
@@ -611,7 +618,8 @@ function sendText(payload, deadline, shouldPreempt) {
 }
 
 function openChatForMedia(payload, deadline) {
-    return payload.confirm_external === true && openContact(payload.contact, deadline);
+    return payload.confirm_external === true &&
+        openContact(payload.contact, deadline, payload.conversation_id);
 }
 
 function sendEmoji(payload, deadline, shouldPreempt) {
@@ -1137,6 +1145,7 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType, task) 
     }
     sleep(600);
     runtime.currentChatContact = null;
+    runtime.currentConversationId = null;
     runtime.chatVerifiedAt = 0;
     const success = verified && answered && hungUp;
     return {
@@ -1359,6 +1368,7 @@ function hangupCurrentCall() {
 
 function openDiscoverItem(item, deadline) {
     runtime.currentChatContact = null;
+    runtime.currentConversationId = null;
     runtime.chatVerifiedAt = 0;
     if (!mainTab('发现', deadline)) return false;
     return retryFreshNode('open_discover_' + item, function () { return visibleText(item, 900); },
@@ -1882,6 +1892,7 @@ function restoreToWechatHome(options) {
             detectWechatPage() === WX_PAGE.MAIN && isMainTabActive('微信');
         trace.push(homeReady ? 'wechat_home_ready' : 'wechat_home_failed');
         runtime.currentChatContact = null;
+        runtime.currentConversationId = null;
         runtime.chatVerifiedAt = 0;
         return {success: homeReady, call_hung_up: callHungUp,
             draft_cleaned: draftCleaned, launcher_fallback: launcherFallback,
@@ -1889,6 +1900,7 @@ function restoreToWechatHome(options) {
             elapsed_ms: time() - startedAt, trace: trace};
     } catch (e) {
         runtime.currentChatContact = null;
+        runtime.currentConversationId = null;
         runtime.chatVerifiedAt = 0;
         return {success: false, error: '' + e, call_hung_up: callHungUp,
             draft_cleaned: draftCleaned, launcher_fallback: launcherFallback,
@@ -1897,6 +1909,30 @@ function restoreToWechatHome(options) {
     } finally {
         try { releaseNode(); } catch (ignoreRelease) {}
     }
+}
+
+function shouldKeepConversationOpen(task, outcome) {
+    const payload = task && task.payload || {};
+    const chatAction = task && ['chat_text', 'chat_emoji', 'chat_voice'].indexOf(
+        task.action_type
+    ) >= 0;
+    if (!chatAction || !outcome || outcome.success !== true ||
+            payload.keep_conversation_open !== true ||
+            payload.participant_last_turn === true || !payload.conversation_id) {
+        return false;
+    }
+    const page = detectWechatPage();
+    const chatPage = page === WX_PAGE.CHAT_TEXT || page === WX_PAGE.CHAT_VOICE ||
+        page === WX_PAGE.CHAT_EMOJI;
+    return chatPage && runtime.currentChatContact === payload.contact &&
+        runtime.currentConversationId === String(payload.conversation_id);
+}
+
+function closeHeldConversationForScan() {
+    if (!runtime.currentConversationId || !isChatPage()) {
+        return {success: true, skipped: true, reason: 'conversation_not_held'};
+    }
+    return restoreToWechatHome({reason: 'scan_claimed_during_conversation'});
 }
 
 function execute(task, shouldPreempt) {
@@ -1944,5 +1980,7 @@ function execute(task, shouldPreempt) {
 var wechatActionExecutor = {
     execute: execute,
     clickVerifiedNode: clickVerifiedNode,
-    restoreToWechatHome: restoreToWechatHome
+    restoreToWechatHome: restoreToWechatHome,
+    shouldKeepConversationOpen: shouldKeepConversationOpen,
+    closeHeldConversationForScan: closeHeldConversationForScan
 };

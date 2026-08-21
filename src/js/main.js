@@ -375,6 +375,20 @@ function getScan(deviceId) {
                     config.pendingUnifiedTask = ret.task;
                     return null;
                 }
+                // 连续会话允许手机停留在聊天页等待下一轮；扫码真正领取时必须
+                // 先结束该页面亲和状态并回到微信首页，再进入原有扫码状态机。
+                try {
+                    const conversationCleanup =
+                        wechatActionExecutor.closeHeldConversationForScan();
+                    if (!conversationCleanup.success) {
+                        loge('扫码领取后退出连续聊天失败: ' +
+                            JSON.stringify(conversationCleanup));
+                        config.wechatRecoveryRequired = true;
+                        wechatActionStorage.putString('recovery_required', 'true');
+                    }
+                } catch (conversationCleanupError) {
+                    loge('扫码领取后清理连续聊天异常: ' + conversationCleanupError);
+                }
                 // 收到任务后立即进入处理中状态，关闭热更新窗口。
                 config.step = 2;
                 const scanPayload = ret.task.payload || {};
@@ -784,7 +798,9 @@ function processWechatAction(task) {
         outcome = normalizeWechatPreemptOutcome(outcome);
         const needsWechatHome = task.action_type !== 'device_sleep' &&
             task.action_type !== 'device_wake' && task.action_type !== 'account_login';
-        if (needsWechatHome) {
+        const conversationKeptOpen = needsWechatHome &&
+            wechatActionExecutor.shouldKeepConversationOpen(task, outcome);
+        if (needsWechatHome && !conversationKeptOpen) {
             const cleanup = wechatActionExecutor.restoreToWechatHome({
                 reason: outcome.preempted === true ? 'preempted' : outcome.success ? 'completed' : 'failed'
             });
@@ -803,6 +819,17 @@ function processWechatAction(task) {
                 outcome.result.cleanup_failed = true;
                 loge('微信动作收尾失败，暂停后续动作直到恢复首页: ' + JSON.stringify(cleanup));
             }
+        } else if (conversationKeptOpen) {
+            const deferredCleanup = {success: true, skipped: true,
+                reason: 'conversation_session_continues', chat_page_verified: true,
+                conversation_id: task.payload.conversation_id};
+            outcome.result = outcome.result || {};
+            outcome.result.cleanup = deferredCleanup;
+            queuePhoneAudit(task, 'conversation_page_retained', 'cleanup_deferred',
+                'info', deferredCleanup);
+            config.wechatRecoveryRequired = false;
+            config.wechatRecoveryAttempts = 0;
+            wechatActionStorage.remove('recovery_required');
         }
         // switch_account 成功时，reportObservedWechatAccount 已按真实昵称原子更新服务器记录。
         if (outcome.success && (task.action_type === 'device_sleep' || task.action_type === 'device_wake')) {
