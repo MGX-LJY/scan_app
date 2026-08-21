@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":172,
+"version":173,
 "dialog":false,
-"msg": "修复双端通话接通识别与按时挂机",
+"msg": "修复长通话接通同步与45秒误判",
 "force": true,
-"md5":"3196d0214a562217852bb7854ac87cb4",
+"md5":"c74b61886afba8733a5b407e20369f51",
 "download_timeout":300
 }
