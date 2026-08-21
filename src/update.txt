@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":169,
+"version":170,
 "dialog":false,
-"msg": "修复表情已发送却被误判失败的问题",
+"msg": "统一手机任务接口并增加独立设备心跳",
 "force": true,
-"md5":"5203fb226b87bf9e67ed9f32c62ec211",
+"md5":"7569a07464c3e91a0b4a8316ee4ccd28",
 "download_timeout":300
 }
