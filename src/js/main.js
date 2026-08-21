@@ -161,6 +161,9 @@ let config = {
     actionHeartbeatGeneration: 0,
     actionPreemptRequested: false,
     actionPreemptReason: null,
+    actionCallState: null,
+    actionCallPeer: null,
+    actionHeartbeatUrgent: false,
     scanTerminalDetected: false, // 后台确认扫码成功后立即停止主线程继续识别/点击授权卡片
     lastClaimAuditTaskId: null,
     verifiedActionAccount: null,
@@ -588,23 +591,33 @@ function startWechatActionHeartbeat(task) {
     config.actionHeartbeatStop = false;
     config.actionPreemptRequested = false;
     config.actionPreemptReason = null;
+    config.actionCallState = null;
+    config.actionCallPeer = null;
+    config.actionHeartbeatUrgent = false;
     const heartbeatGeneration = ++config.actionHeartbeatGeneration;
+    const callTask = ['voice_call', 'video_call', 'call_dial', 'call_answer'].indexOf(
+        task.action_type
+    ) >= 0;
     thread.execAsync(function () {
-        let nextHeartbeatAt = time() + 15000;
+        let nextHeartbeatAt = time() + (callTask ? 2500 : 15000);
         while (!config.actionHeartbeatStop && config.actionHeartbeatGeneration === heartbeatGeneration) {
             sleep(2500);
             if (config.actionHeartbeatStop || config.actionHeartbeatGeneration !== heartbeatGeneration) break;
             try {
-                if (time() >= nextHeartbeatAt && !config.actionHeartbeatStop) {
+                if ((time() >= nextHeartbeatAt || config.actionHeartbeatUrgent) &&
+                        !config.actionHeartbeatStop) {
                     const heartbeatUrl = `${config.baseUrl}/api/wechat/v1/tasks/${task.task_id}/heartbeat`;
                     let res = http.postJSON(heartbeatUrl, JSON.stringify({
                         task_id: task.task_id,
                         phone_id: config.deviceId,
                         device_id: config.deviceId,
-                        dispatch_token: task.dispatch_token
+                        dispatch_token: task.dispatch_token,
+                        call_state: config.actionCallState
                     }), 6000, null);
                     let ret = JSON.parse(res);
                     if (ret.success) {
+                        config.actionHeartbeatUrgent = false;
+                        config.actionCallPeer = ret.call_peer || null;
                         if (ret.task) {
                             task.deadline = ret.task.soft_deadline;
                             task.hard_deadline = ret.task.hard_deadline;
@@ -615,11 +628,13 @@ function startWechatActionHeartbeat(task) {
                             }
                         }
                     }
-                    nextHeartbeatAt = time() + 15000;
+                    nextHeartbeatAt = time() + (callTask ? 3000 : 15000);
                 }
             } catch (e) {
                 logw('微信动作心跳失败: ' + e);
-                if (time() >= nextHeartbeatAt) nextHeartbeatAt = time() + 15000;
+                if (time() >= nextHeartbeatAt) {
+                    nextHeartbeatAt = time() + (callTask ? 3000 : 15000);
+                }
             }
         }
     });
@@ -834,6 +849,9 @@ function processWechatAction(task) {
         config.actionHeartbeatStop = true;
         config.actionPreemptRequested = false;
         config.actionPreemptReason = null;
+        config.actionCallState = null;
+        config.actionCallPeer = null;
+        config.actionHeartbeatUrgent = false;
         try { releaseNode(); } catch (ignoreRelease) {}
         config.pauseResultWatcher = false;
         config.actionInProgress = false;

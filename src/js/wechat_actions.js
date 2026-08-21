@@ -929,6 +929,15 @@ function waitForCallExit(timeoutMs) {
         lastState && lastState.text || 'call_exit_timeout'};
 }
 
+function pairedCallConnectedEvidence(payload) {
+    const peer = config.actionCallPeer;
+    const expectedSession = String(payload.call_session_id || '');
+    if (!peer || peer.connected !== true || !expectedSession ||
+            String(peer.call_session_id || '') !== expectedSession) return null;
+    return {source: 'paired_receiver_heartbeat:' +
+        String(peer.evidence || 'connected'), peer_task_id: peer.task_id || null};
+}
+
 function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
     const isVideo = callType === 'video';
     const callLabel = isVideo ? '视频通话' : '语音通话';
@@ -995,10 +1004,11 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
         if (state === '对方已拒绝') { endReason = 'declined'; break; }
         if (state === '对方忙线') { endReason = 'busy'; break; }
         if (state === '通话结束') { endReason = 'remote_ended'; break; }
-        if (!answered && callState.connected) {
+        const peerConnected = pairedCallConnectedEvidence(payload);
+        if (!answered && (callState.connected || peerConnected)) {
             answered = true;
             connectedAt = time();
-            connectedEvidence = callState.connected_evidence;
+            connectedEvidence = callState.connected_evidence || peerConnected.source;
             connectedDeadline = Math.min(connectedAt + durationSeconds * 1000, hardStopDeadline);
         }
         if (answered && !callState.voip_activity && !hangupVisible && !state) {
@@ -1153,6 +1163,13 @@ function answerIncomingCall(payload, shouldPreempt, taskDeadline) {
             result: {answered: false, end_reason: 'connected_evidence_missing'},
             error: '点击接听后未检测到真实通话计时'};
     }
+    config.actionCallState = {
+        call_session_id: payload.call_session_id || null,
+        connected: true,
+        connected_at: time(),
+        evidence: connectedState ? connectedState.connected_evidence : 'connected'
+    };
+    config.actionHeartbeatUrgent = true;
     const startedAt = time();
     const audioState = ensureCallAudioMuted();
     const duration = Math.max(5, Math.min(1800,
