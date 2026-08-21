@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":170,
+"version":171,
 "dialog":false,
-"msg": "统一手机任务接口并增加独立设备心跳",
+"msg": "修复语音通话拨打接听状态机",
 "force": true,
-"md5":"7569a07464c3e91a0b4a8316ee4ccd28",
+"md5":"14cf39a7b26cee81766921cf53fceb86",
 "download_timeout":300
 }
