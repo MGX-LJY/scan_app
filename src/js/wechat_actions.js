@@ -9,7 +9,8 @@ const runtime = {
     currentChatContact: null,
     chatVerifiedAt: 0,
     lastTextInputFailure: null,
-    lastContactFailure: null
+    lastContactFailure: null,
+    lastCallHangupMethod: null
 };
 
 function wechatXmlSnapshot() {
@@ -780,53 +781,152 @@ function ensureCallAudioMuted() {
 }
 
 function hangUpVoiceCall(knownCallActive) {
+    runtime.lastCallHangupMethod = null;
     const nodeClicked = clickCallControl('挂断') || clickCallControl('取消');
-    if (nodeClicked) return true;
+    if (nodeClicked) {
+        runtime.lastCallHangupMethod = 'accessibility_control';
+        return true;
+    }
     // 部分微信版本 VoIP 控件不进入节点树；仅在已验证 VoIP Activity 后，
     // 在底部中央限定区域寻找红色挂断圆，禁止在普通页面使用坐标回退。
-    const state = voiceCallPageState();
-    if (!state.voip_activity && knownCallActive !== true) return false;
+    let state = voiceCallPageState();
+    if (!state.live_call) {
+        // 微信在挂断后的短时间内仍可能返回 VideoActivity。仅有残留 Activity
+        // 不能证明通话仍存在，否则屏幕中心的“唤醒控件”点击会落到聊天列表。
+        if (!state.voip_activity || knownCallActive !== true) return false;
+        waitFor(function () {
+            state = voiceCallPageState();
+            return state.live_call || !state.voip_activity;
+        }, 1400, 200);
+        if (!state.live_call) {
+            runtime.lastCallHangupMethod = 'already_ended_activity_stale';
+            return false;
+        }
+    }
     humanizedPointClick(~~(device.getScreenWidth() * 0.5), ~~(device.getScreenHeight() * 0.48), 8);
     sleep(500);
     if (clickCallControl('挂断') || clickCallControl('取消')) {
+        runtime.lastCallHangupMethod = 'revealed_accessibility_control';
         return true;
     }
     const width = device.getScreenWidth(), height = device.getScreenHeight();
     const red = findCallColor('#e84b4f', ~~(width * 0.34), ~~(height * 0.74),
         ~~(width * 0.66), ~~(height * 0.96), 0.70);
-    return !!(red && humanizedPointClick(red.x, red.y, 5));
+    const visualClicked = !!(red && humanizedPointClick(red.x, red.y, 5));
+    if (visualClicked) runtime.lastCallHangupMethod = 'verified_red_control';
+    return visualClicked;
+}
+
+function callDurationEvidence(xml) {
+    const snapshot = xml || '';
+    const descMarker = 'desc="通话时长';
+    const descIndex = snapshot.indexOf(descMarker);
+    if (descIndex >= 0) {
+        const descEnd = snapshot.indexOf('"', descIndex + descMarker.length);
+        return {source: 'duration_desc', value: descEnd > descIndex ?
+            snapshot.substring(descIndex + 6, descEnd) : '通话时长'};
+    }
+    // 当前 Redmi K20 Pro 的通话界面视觉计时为 00:03；部分微信版本
+    // 只把它暴露为 text 而不是“通话时长”desc。XML来自微信根节点，
+    // 再与 VideoActivity 交叉验证，避免把系统状态栏时间当作通话计时。
+    const timerMatch = snapshot.match(/(?:text|desc)="((?:[0-9]{1,2}:)?[0-5][0-9]:[0-5][0-9])"/);
+    return timerMatch ? {source: 'duration_text', value: timerMatch[1]} : null;
+}
+
+let callSystemEvidenceCacheAt = 0;
+let callSystemEvidenceCache = null;
+
+function callSystemConnectedEvidence() {
+    const now = time();
+    if (now - callSystemEvidenceCacheAt < 750) return callSystemEvidenceCache;
+    callSystemEvidenceCacheAt = now;
+    callSystemEvidenceCache = null;
+    try {
+        const notifications = shell.execCommand('dumpsys notification --noredact') || '';
+        if (notifications.indexOf('tickerText=语音通话中') >= 0 ||
+            notifications.indexOf('android.text=String (语音通话中)') >= 0) {
+            callSystemEvidenceCache = 'wechat_call_notification';
+            return callSystemEvidenceCache;
+        }
+    } catch (ignoreNotificationEvidence) {}
+    try {
+        const audio = shell.execCommand('dumpsys audio') || '';
+        const activePlayback = audio.indexOf(
+            'state:started attr:AudioAttributes: usage=USAGE_VOICE_COMMUNICATION') >= 0;
+        const activeRecording = /active\? true[\s\S]{0,500}source client=VOICE_COMMUNICATION[\s\S]{0,350}pack:com\.tencent\.mm/.test(audio);
+        if (activePlayback && activeRecording) {
+            callSystemEvidenceCache = 'wechat_voice_audio_session';
+            return callSystemEvidenceCache;
+        }
+    } catch (ignoreAudioEvidence) {}
+    return null;
+}
+
+function currentWechatVoipActivity() {
+    let activity = '';
+    try { activity = runningWechatActivity() || ''; } catch (ignoreActivity) {}
+    if (activity) return activity.indexOf('plugin.voip.ui.VideoActivity') >= 0;
+    try {
+        const activities = shell.execCommand('dumpsys activity activities') || '';
+        return /mResumedActivity:[^\r\n]*com\.tencent\.mm\/(?:\.plugin)?\.voip\.ui\.VideoActivity/.test(activities) ||
+            /ResumedActivity:[^\r\n]*com\.tencent\.mm\/(?:\.plugin)?\.voip\.ui\.VideoActivity/.test(activities);
+    } catch (ignoreShellActivity) {
+        return false;
+    }
 }
 
 function voiceCallPageState() {
-    let voipActivity = false;
-    try {
-        const top = shell.execCommand('dumpsys activity top') || '';
-        voipActivity = top.indexOf('com.tencent.mm.plugin.voip.ui.VideoActivity') >= 0;
-    } catch (ignoreActivity) {}
-    const stateText = hasAnyVisibleText([
+    const xml = wechatXmlSnapshot();
+    const voipActivity = currentWechatVoipActivity();
+    function attr(name, value) { return xml.indexOf(name + '="' + value + '"') >= 0; }
+    function attrPrefix(name, value) { return xml.indexOf(name + '="' + value) >= 0; }
+    const states = [
         '正在等待对方接受邀请', '等待对方接受邀请', '通话中',
         '对方无应答', '对方已拒绝', '对方忙线', '通话结束'
-    ]);
-    const waitingDesc = hasVisibleDesc('等待对方接受邀请', 180) ||
-        withNode(function () { return descMatch('^等待对方接受邀请.*').pkg(WX_PACKAGE).getOneNodeInfo(180); },
-            function (node) { return node.visible; });
-    const durationVisible = withNode(function () {
-        return descMatch('^通话时长.*').pkg(WX_PACKAGE).getOneNodeInfo(180);
-    }, function (node) { return node.visible; });
-    const hangupVisible = withNode(function () {
-        let nodes = desc('挂断').pkg(WX_PACKAGE).getNodeInfo(180);
-        if (nodes) for (let i = 0; i < nodes.length; i++) if (nodes[i].visible) return nodes[i];
-        nodes = text('挂断').pkg(WX_PACKAGE).getNodeInfo(180);
-        if (nodes) for (let j = 0; j < nodes.length; j++) if (nodes[j].visible) return nodes[j];
-        nodes = desc('取消').pkg(WX_PACKAGE).getNodeInfo(180);
-        if (nodes) for (let k = 0; k < nodes.length; k++) if (nodes[k].visible) return nodes[k];
-        return null;
-    }, function (node) { return node.visible; });
-    return {text: stateText || (waitingDesc ? '等待对方接受邀请' : null),
-        hangup: hangupVisible, voip_activity: voipActivity || durationVisible,
-        // VideoActivity 和挂断按钮在“等待对方接听”阶段也会出现，只有明确的
-        // “通话中”文本或通话时长节点才能作为真正接通证据。
-        connected: stateText === '通话中' || durationVisible};
+    ];
+    let stateText = null;
+    for (let stateIndex = 0; stateIndex < states.length; stateIndex++) {
+        if (attr('text', states[stateIndex]) || attr('desc', states[stateIndex])) {
+            stateText = states[stateIndex];
+            break;
+        }
+    }
+    const waitingVisible = attrPrefix('desc', '等待对方接受邀请') ||
+        attrPrefix('text', '等待对方接受邀请') || stateText === '正在等待对方接受邀请';
+    const duration = callDurationEvidence(xml);
+    const hangupVisible = attr('desc', '挂断') || attr('text', '挂断');
+    const cancelVisible = attr('desc', '取消') || attr('text', '取消');
+    const systemEvidence = stateText === '通话中' || duration ? null :
+        callSystemConnectedEvidence();
+    const connectedEvidence = stateText === '通话中' ? 'connected_text' :
+        (duration ? duration.source : systemEvidence);
+    const connected = connectedEvidence !== null;
+    const terminal = stateText === '通话结束' || stateText === '对方无应答' ||
+        stateText === '对方已拒绝' || stateText === '对方忙线';
+    const liveCall = !terminal && (connected || waitingVisible || hangupVisible ||
+        (voipActivity && (cancelVisible || stateText !== null)));
+    return {text: stateText || (waitingVisible ? '等待对方接受邀请' : null),
+        hangup: hangupVisible || cancelVisible, voip_activity: voipActivity,
+        live_call: liveCall, waiting: waitingVisible, duration: duration,
+        system_evidence: systemEvidence,
+        connected_evidence: connectedEvidence, connected: connected};
+}
+
+function waitForCallExit(timeoutMs) {
+    const deadline = time() + Math.max(1000, timeoutMs || 6000);
+    let clearPolls = 0;
+    let lastState = null;
+    while (time() < deadline) {
+        lastState = voiceCallPageState();
+        if (!lastState.live_call) clearPolls++; else clearPolls = 0;
+        if (clearPolls >= 3) {
+            return {ended: true, evidence: lastState.voip_activity ?
+                'activity_stale_without_call_evidence' : 'voip_activity_gone'};
+        }
+        sleep(250);
+    }
+    return {ended: false, evidence: lastState && lastState.connected_evidence ||
+        lastState && lastState.text || 'call_exit_timeout'};
 }
 
 function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
@@ -876,6 +976,7 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
     let verified = false;
     let connectedAt = 0;
     let connectedDeadline = 0;
+    let connectedEvidence = null;
     let disconnectedPolls = 0;
     let audioState = {microphone_off: false, speaker_off: false};
     let audioConfigured = false;
@@ -897,6 +998,7 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
         if (!answered && callState.connected) {
             answered = true;
             connectedAt = time();
+            connectedEvidence = callState.connected_evidence;
             connectedDeadline = Math.min(connectedAt + durationSeconds * 1000, hardStopDeadline);
         }
         if (answered && !callState.voip_activity && !hangupVisible && !state) {
@@ -912,8 +1014,20 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
         sleep(800);
     }
     if (time() >= hardStopDeadline && answered) endReason = 'duration_complete';
-    const hungUp = answered && endReason === 'remote_ended' ? true :
-        (verified ? hangUpVoiceCall(true) : false);
+    let hungUp = answered && endReason === 'remote_ended';
+    let hangupExit = hungUp ? {ended: true, evidence: 'remote_end_detected'} : null;
+    if (!hungUp && verified) {
+        const beforeHangup = voiceCallPageState();
+        if (answered && !beforeHangup.live_call) {
+            endReason = 'remote_ended';
+            hungUp = true;
+            hangupExit = {ended: true, evidence: 'call_evidence_disappeared_before_hangup'};
+        } else {
+            const hangupClicked = hangUpVoiceCall(true);
+            hangupExit = waitForCallExit(7000);
+            hungUp = hangupClicked && hangupExit.ended;
+        }
+    }
     sleep(600);
     runtime.currentChatContact = null;
     runtime.chatVerifiedAt = 0;
@@ -924,6 +1038,9 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
                  elapsed_seconds: ~~((time() - startedAt) / 1000),
                  connected_seconds: connectedAt ? ~~((time() - connectedAt) / 1000) : 0,
                  requested_duration_seconds: durationSeconds, hung_up: hungUp,
+                 connected_evidence: connectedEvidence,
+                 hangup_method: runtime.lastCallHangupMethod,
+                 hangup_exit_evidence: hangupExit ? hangupExit.evidence : null,
                  microphone_off: audioState.microphone_off, speaker_off: audioState.speaker_off},
         error: !verified ? '拨号页面未验证成功' : !answered ? '对方未接听' :
             !hungUp ? '通话结束后挂断失败' : null
@@ -965,22 +1082,30 @@ function findIncomingCallCard(width, height) {
         // 张截图中同时确认右侧绿色接听与左侧红色拒接按钮，避免颜色误命中。
         const greenColors = ['0x0db209', '0x07c160', '0x00c800'];
         const redColors = ['0xda4a4a', '0xe84b4f', '0xfa5151'];
-        let greenPoints = null, redPoints = null;
-        for (let greenIndex = 0; greenIndex < greenColors.length && (!greenPoints || !greenPoints.length); greenIndex++) {
-            greenPoints = image.findColor(screen, greenColors[greenIndex], 0.86,
+        // EasyClick 的 findColor 结果可能复用底层缓冲区；下一次找色会让上一次
+        // points 失效。每次命中后必须立刻复制为普通坐标对象，不能跨调用保留数组。
+        let greenPoint = null, redPoint = null, foundPoints = null;
+        for (let greenIndex = 0; greenIndex < greenColors.length && !greenPoint; greenIndex++) {
+            foundPoints = image.findColor(screen, greenColors[greenIndex], 0.86,
                 ~~(width * 0.78), ~~(height * 0.06), ~~(width * 0.98), ~~(height * 0.20), 1, 1);
+            if (foundPoints && foundPoints.length) {
+                greenPoint = {x: foundPoints[0].x, y: foundPoints[0].y};
+            }
         }
-        for (let redIndex = 0; redIndex < redColors.length && (!redPoints || !redPoints.length); redIndex++) {
-            redPoints = image.findColor(screen, redColors[redIndex], 0.84,
+        for (let redIndex = 0; redIndex < redColors.length && !redPoint; redIndex++) {
+            foundPoints = image.findColor(screen, redColors[redIndex], 0.84,
                 ~~(width * 0.58), ~~(height * 0.06), ~~(width * 0.78), ~~(height * 0.20), 1, 1);
+            if (foundPoints && foundPoints.length) {
+                redPoint = {x: foundPoints[0].x, y: foundPoints[0].y};
+            }
         }
-        if (!greenPoints || !greenPoints.length || !redPoints || !redPoints.length) return null;
+        if (!greenPoint || !redPoint) return null;
         return {
             green: {x: ~~(width * 0.868), y: ~~(height * 0.108)},
             red: {x: ~~(width * 0.685), y: ~~(height * 0.108)},
             evidence: {
-                green: {x: greenPoints[0].x, y: greenPoints[0].y},
-                red: {x: redPoints[0].x, y: redPoints[0].y}
+                green: greenPoint,
+                red: redPoint
             }
         };
     } catch (e) {
@@ -1012,28 +1137,72 @@ function answerIncomingCall(payload, shouldPreempt, taskDeadline) {
         result: {incoming_wait_seconds: waitSeconds, end_reason: 'incoming_call_timeout'},
         error: '等待期间未视觉确认到完整来电卡片'};
     humanizedPointClick(card.green.x, card.green.y, 5);
-    const connected = waitFor(function () { return voiceCallPageState().voip_activity; }, 5000, 250);
-    if (!connected) return {success: false, error: '点击接听后未进入通话页面'};
+    let connectedState = null;
+    const connected = waitFor(function () {
+        const state = voiceCallPageState();
+        if (state.connected) connectedState = state;
+        return state.connected;
+    }, 15000, 250);
+    if (!connected) {
+        const unfinished = voiceCallPageState();
+        if (unfinished.live_call) {
+            hangUpVoiceCall(true);
+            waitForCallExit(5000);
+        }
+        return {success: false,
+            result: {answered: false, end_reason: 'connected_evidence_missing'},
+            error: '点击接听后未检测到真实通话计时'};
+    }
     const startedAt = time();
     const audioState = ensureCallAudioMuted();
     const duration = Math.max(5, Math.min(1800,
         intOrDefault(payload.duration_seconds || payload.max_duration_seconds, 60)));
-    const deadline = Math.min(startedAt + duration * 1000,
-        (taskDeadline || startedAt + duration * 1000) - 2000);
-    let reason = 'duration_complete';
-    while (time() < deadline) {
+    const nominalDeadline = startedAt + duration * 1000;
+    // 拨打方是计划通话的默认挂断方。接听方多等8秒观察远端结束，
+    // 只有拨打方未能结束时才执行安全兜底挂断，避免双方同时抢点挂断键。
+    const safetyDeadline = Math.min(nominalDeadline + 8000,
+        (taskDeadline || nominalDeadline + 8000) - 2000);
+    let reason = 'awaiting_caller_hangup';
+    let disconnectedPolls = 0;
+    while (time() < safetyDeadline) {
         if (shouldPreempt && shouldPreempt()) { reason = 'preempted'; break; }
         const callState = voiceCallPageState();
         if (callState.text === '通话结束' || callState.text === '对方已拒绝' ||
             callState.text === '对方忙线') { reason = 'remote_ended'; break; }
-        if (!isWechatForeground()) { reason = 'wechat_not_foreground'; break; }
+        if (!callState.live_call) {
+            disconnectedPolls++;
+            if (disconnectedPolls >= 4) { reason = 'remote_ended'; break; }
+        } else {
+            disconnectedPolls = 0;
+        }
+        if (!isWechatForeground() && disconnectedPolls === 0) {
+            reason = 'wechat_not_foreground';
+            break;
+        }
         sleep(500);
     }
-    const hungUp = reason === 'remote_ended' ? true : hangUpVoiceCall(true);
+    let hungUp = reason === 'remote_ended';
+    let hangupExit = hungUp ? {ended: true, evidence: 'remote_end_detected'} : null;
+    if (!hungUp) {
+        if (reason === 'awaiting_caller_hangup') reason = 'duration_safety_hangup';
+        const stateBeforeHangup = voiceCallPageState();
+        if (!stateBeforeHangup.live_call) {
+            reason = 'remote_ended';
+            hungUp = true;
+            hangupExit = {ended: true, evidence: 'call_evidence_disappeared_before_hangup'};
+        } else {
+            const hangupClicked = hangUpVoiceCall(true);
+            hangupExit = waitForCallExit(7000);
+            hungUp = hangupClicked && hangupExit.ended;
+        }
+    }
     return {success: hungUp, preempted: reason === 'preempted',
         result: {answered: true, call_type: payload.call_type || 'any',
             elapsed_seconds: ~~((time() - startedAt) / 1000), end_reason: reason, hung_up: hungUp,
             call_session_id: payload.call_session_id || null,
+            connected_evidence: connectedState ? connectedState.connected_evidence : null,
+            hangup_method: runtime.lastCallHangupMethod,
+            hangup_exit_evidence: hangupExit ? hangupExit.evidence : null,
             microphone_off: audioState.microphone_off, speaker_off: audioState.speaker_off},
         error: hungUp ? null : '到时挂断失败'};
 }
@@ -1513,10 +1682,23 @@ function restoreToWechatHome(options) {
     let miniProgramClosed = false;
     try {
         // 通话必须最先终止，否则 LauncherUI 可能只缩小通话悬浮层。
-        if (voiceCallPageState().voip_activity) {
+        let initialCallState = voiceCallPageState();
+        if (!initialCallState.live_call && initialCallState.voip_activity) {
+            // 动作函数刚挂断时 Activity 可能滞留一两秒。先等待转场，严禁
+            // 因为这个残留 Activity 再点一次屏幕中心。
+            waitFor(function () {
+                initialCallState = voiceCallPageState();
+                return initialCallState.live_call || !initialCallState.voip_activity;
+            }, 1800, 250);
+        }
+        if (initialCallState.live_call) {
             callHungUp = hangUpVoiceCall(true);
             trace.push(callHungUp ? 'call_hung_up' : 'call_hangup_failed');
+            const cleanupCallExit = waitForCallExit(6000);
+            trace.push(cleanupCallExit.ended ? 'call_exit_verified' : 'call_exit_unverified');
             sleep(random(350, 700));
+        } else if (initialCallState.voip_activity) {
+            trace.push('stale_voip_activity_ignored');
         }
         // 小程序必须使用右上角胶囊中的“关闭”退出，再回微信首页；不得把
         // 小程序未知页交给 LauncherUI 覆盖，更不能为此重启或退出微信。

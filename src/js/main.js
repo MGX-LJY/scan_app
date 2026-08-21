@@ -261,8 +261,13 @@ function showErrMsg(msg) {
 }
 
 function initConfig() {
-    config.deviceId = readConfigString('deviceId');
-    const wxArr = readConfigString('weixinArr').trim();
+    let runtimeArgs = {};
+    try {
+        if (typeof getCliArgs === 'function') runtimeArgs = getCliArgs() || {};
+    } catch (ignoreCliArgs) {}
+    config.deviceId = String(readConfigString('deviceId') || runtimeArgs.deviceId ||
+        runtimeArgs.phone_id || '').trim();
+    const wxArr = String(readConfigString('weixinArr') || runtimeArgs.weixinArr || '').trim();
     // 固定12台手机的账号归属由服务器配置；旧字段仅保留协议兼容。
     config.wxArr = wxArr ? wxArr.split('#') : [];
     if (config.wxArr.length > 2) {
@@ -1824,6 +1829,7 @@ function main() {
     setECSystemConfig(m);
     laoleng.EC.init();
     laoleng.EC.initImage(true, 10);
+    // 生产端继续使用原有快速节点模式；增强模式只保留在节点实验室中验证。
     setFetchNodeMode(2, false, false, "nsf");//设置节点抓取方式
     importClass(android.os.PowerManager)
     device.keepAwake(PowerManager.SCREEN_DIM_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP);
