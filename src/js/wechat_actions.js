@@ -929,8 +929,44 @@ function waitForCallExit(timeoutMs) {
         lastState && lastState.text || 'call_exit_timeout'};
 }
 
-function pairedCallConnectedEvidence(payload) {
-    const peer = config.actionCallPeer;
+function syncCallTaskHeartbeat(task, callState) {
+    if (!task || !task.task_id || !task.dispatch_token) {
+        return {success: false, peer: null, error: 'call_task_identity_missing'};
+    }
+    try {
+        const heartbeatUrl = config.baseUrl + '/api/wechat/v1/tasks/' +
+            task.task_id + '/heartbeat';
+        const response = http.postJSON(heartbeatUrl, JSON.stringify({
+            task_id: task.task_id,
+            phone_id: config.deviceId,
+            device_id: config.deviceId,
+            dispatch_token: task.dispatch_token,
+            call_state: callState || null
+        }), 5000, null);
+        const body = JSON.parse(response);
+        if (!body.success) {
+            return {success: false, peer: null,
+                error: body.message || 'call_heartbeat_rejected'};
+        }
+        config.actionCallPeer = body.call_peer || null;
+        if (body.task) {
+            task.deadline = body.task.soft_deadline;
+            task.hard_deadline = body.task.hard_deadline;
+        }
+        if (body.preempt === true) {
+            config.actionPreemptRequested = true;
+            config.actionPreemptReason = body.preempt_reason ||
+                body.task && body.task.preempt_reason || 'task_preempted';
+        }
+        return {success: true, peer: body.call_peer || null, error: null};
+    } catch (error) {
+        logw('通话状态同步失败: ' + error);
+        return {success: false, peer: null, error: '' + error};
+    }
+}
+
+function pairedCallConnectedEvidence(payload, directPeer) {
+    const peer = directPeer || config.actionCallPeer;
     const expectedSession = String(payload.call_session_id || '');
     if (!peer || peer.connected !== true || !expectedSession ||
             String(peer.call_session_id || '') !== expectedSession) return null;
@@ -938,7 +974,7 @@ function pairedCallConnectedEvidence(payload) {
         String(peer.evidence || 'connected'), peer_task_id: peer.task_id || null};
 }
 
-function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
+function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType, task) {
     const isVideo = callType === 'video';
     const callLabel = isVideo ? '视频通话' : '语音通话';
     if (payload.confirm_external !== true) return {success: false, error: callLabel + '未明确授权'};
@@ -976,6 +1012,10 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
     const startedAt = time();
     const ringDeadline = startedAt + Math.max(10, Math.min(120,
         intOrDefault(payload.ring_timeout_seconds, 45))) * 1000;
+    // 网络短暂抖动时不能在45秒边界直接把已经接通的通话判成未接听。
+    // 仅在最后一次同步查询也失败时，最多追加8秒证据确认窗口。
+    const ringEvidenceDeadline = Math.min(ringDeadline + 8000,
+        (taskDeadline || ringDeadline + 8000) - 2500);
     const durationSeconds = Math.max(5, Math.min(1800,
         intOrDefault(payload.duration_seconds !== undefined ?
             payload.duration_seconds : payload.max_duration_seconds, 60)));
@@ -989,6 +1029,11 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
     let disconnectedPolls = 0;
     let audioState = {microphone_off: false, speaker_off: false};
     let audioConfigured = false;
+    let nextPeerProbeAt = startedAt;
+    let peerProbe = null;
+    let lastPeerProbeAt = 0;
+    let peerConnected = null;
+    let ringBoundaryChecked = false;
     while (time() < hardStopDeadline) {
         if (hasSafetyBlocker()) { endReason = 'account_attention_required'; break; }
         if (shouldPreempt && shouldPreempt()) { endReason = 'scan_preempted'; break; }
@@ -1004,9 +1049,17 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
         if (state === '对方已拒绝') { endReason = 'declined'; break; }
         if (state === '对方忙线') { endReason = 'busy'; break; }
         if (state === '通话结束') { endReason = 'remote_ended'; break; }
-        const peerConnected = pairedCallConnectedEvidence(payload);
+        if (!answered && time() >= nextPeerProbeAt) {
+            peerProbe = syncCallTaskHeartbeat(task, null);
+            lastPeerProbeAt = time();
+            nextPeerProbeAt = time() + 2500;
+        }
+        peerConnected = pairedCallConnectedEvidence(payload,
+            peerProbe && peerProbe.success ? peerProbe.peer : null);
         if (!answered && (callState.connected || peerConnected)) {
             answered = true;
+            // 同一call_session_id下被叫端的接通证明也证明拨号动作真实发生。
+            verified = true;
             connectedAt = time();
             connectedEvidence = callState.connected_evidence || peerConnected.source;
             connectedDeadline = Math.min(connectedAt + durationSeconds * 1000, hardStopDeadline);
@@ -1017,7 +1070,32 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
         } else {
             disconnectedPolls = 0;
         }
-        if (!answered && time() >= ringDeadline) { endReason = 'ring_timeout'; break; }
+        if (!answered && time() >= ringDeadline) {
+            // 边界处强制在动作主线程再查一次，不能依赖后台线程写入的共享变量。
+            if (lastPeerProbeAt < ringDeadline) {
+                peerProbe = syncCallTaskHeartbeat(task, null);
+                lastPeerProbeAt = time();
+            }
+            ringBoundaryChecked = peerProbe && peerProbe.success === true;
+            peerConnected = pairedCallConnectedEvidence(payload,
+                ringBoundaryChecked ? peerProbe.peer : null);
+            if (peerConnected) {
+                answered = true;
+                verified = true;
+                connectedAt = time();
+                connectedEvidence = peerConnected.source;
+                connectedDeadline = Math.min(connectedAt + durationSeconds * 1000,
+                    hardStopDeadline);
+            } else if (ringBoundaryChecked) {
+                endReason = 'ring_timeout';
+                break;
+            } else if (time() >= ringEvidenceDeadline) {
+                endReason = 'peer_state_unavailable';
+                break;
+            } else {
+                nextPeerProbeAt = time() + 800;
+            }
+        }
         if (answered && time() >= connectedDeadline) { endReason = 'duration_complete'; break; }
         if (!isWechatForeground()) { endReason = 'wechat_not_foreground'; break; }
         // 控制栏会自动隐藏；节点暂时消失不代表通话已经结束。
@@ -1052,17 +1130,18 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
                  hangup_method: runtime.lastCallHangupMethod,
                  hangup_exit_evidence: hangupExit ? hangupExit.evidence : null,
                  microphone_off: audioState.microphone_off, speaker_off: audioState.speaker_off},
-        error: !verified ? '拨号页面未验证成功' : !answered ? '对方未接听' :
+        error: endReason === 'peer_state_unavailable' ? '无法确认对端接通状态' :
+            !verified ? '拨号页面未验证成功' : !answered ? '对方未接听' :
             !hungUp ? '通话结束后挂断失败' : null
     };
 }
 
-function makeVoiceCall(payload, shouldPreempt, taskDeadline) {
-    return makeOutgoingCall(payload, shouldPreempt, taskDeadline, 'voice');
+function makeVoiceCall(payload, shouldPreempt, taskDeadline, task) {
+    return makeOutgoingCall(payload, shouldPreempt, taskDeadline, 'voice', task);
 }
 
-function makeVideoCall(payload, shouldPreempt, taskDeadline) {
-    return makeOutgoingCall(payload, shouldPreempt, taskDeadline, 'video');
+function makeVideoCall(payload, shouldPreempt, taskDeadline, task) {
+    return makeOutgoingCall(payload, shouldPreempt, taskDeadline, 'video', task);
 }
 
 function findCallColor(color, left, top, right, bottom, threshold) {
@@ -1126,7 +1205,7 @@ function findIncomingCallCard(width, height) {
     }
 }
 
-function answerIncomingCall(payload, shouldPreempt, taskDeadline) {
+function answerIncomingCall(payload, shouldPreempt, taskDeadline, task) {
     if (payload.confirm_external !== true) return {success: false, error: '接听通话未明确授权'};
     const width = device.getScreenWidth(), height = device.getScreenHeight();
     const waitSeconds = Math.max(10, Math.min(240,
@@ -1170,6 +1249,16 @@ function answerIncomingCall(payload, shouldPreempt, taskDeadline) {
         evidence: connectedState ? connectedState.connected_evidence : 'connected'
     };
     config.actionHeartbeatUrgent = true;
+    // 接通是双方通话状态机的关键栅栏。主线程立即同步，避免EasyClick后台
+    // 线程对共享对象的可见性延迟让拨打端在ring_timeout处误判未接听。
+    let connectionReport = null;
+    let connectionReportAttempt = 0;
+    while (connectionReportAttempt < 3) {
+        connectionReport = syncCallTaskHeartbeat(task, config.actionCallState);
+        if (connectionReport.success) break;
+        connectionReportAttempt++;
+        if (connectionReportAttempt < 3) sleep(500);
+    }
     const startedAt = time();
     const audioState = ensureCallAudioMuted();
     const duration = Math.max(5, Math.min(1800,
@@ -1220,6 +1309,7 @@ function answerIncomingCall(payload, shouldPreempt, taskDeadline) {
             connected_evidence: connectedState ? connectedState.connected_evidence : null,
             hangup_method: runtime.lastCallHangupMethod,
             hangup_exit_evidence: hangupExit ? hangupExit.evidence : null,
+            connection_state_reported: connectionReport && connectionReport.success === true,
             microphone_off: audioState.microphone_off, speaker_off: audioState.speaker_off},
         error: hungUp ? null : '到时挂断失败'};
 }
@@ -1794,13 +1884,13 @@ function execute(task, shouldPreempt) {
     if (task.action_type === 'chat_inspect') return inspectChat(task.payload || {}, actionDeadline);
     if (task.action_type === 'chat_emoji') return sendEmoji(task.payload || {}, actionDeadline, shouldPreempt);
     if (task.action_type === 'chat_voice') return sendVoice(task.payload || {}, actionDeadline, shouldPreempt);
-    if (task.action_type === 'voice_call') return makeVoiceCall(task.payload || {}, shouldPreempt, actionDeadline);
-    if (task.action_type === 'video_call') return makeVideoCall(task.payload || {}, shouldPreempt, actionDeadline);
+    if (task.action_type === 'voice_call') return makeVoiceCall(task.payload || {}, shouldPreempt, actionDeadline, task);
+    if (task.action_type === 'video_call') return makeVideoCall(task.payload || {}, shouldPreempt, actionDeadline, task);
     if (task.action_type === 'call_dial') {
         return makeOutgoingCall(task.payload || {}, shouldPreempt, actionDeadline,
-            (task.payload || {}).call_type === 'video' ? 'video' : 'voice');
+            (task.payload || {}).call_type === 'video' ? 'video' : 'voice', task);
     }
-    if (task.action_type === 'call_answer') return answerIncomingCall(task.payload || {}, shouldPreempt, actionDeadline);
+    if (task.action_type === 'call_answer') return answerIncomingCall(task.payload || {}, shouldPreempt, actionDeadline, task);
     if (task.action_type === 'call_hangup') return hangupCurrentCall();
     if (task.action_type === 'channels_browse') return browseChannels(task.payload || {}, shouldPreempt, actionDeadline);
     if (task.action_type === 'moment_browse') return browseMoments(task.payload || {}, actionDeadline, shouldPreempt);
