@@ -740,7 +740,7 @@ function hangUpVoiceCall(knownCallActive) {
     if (!state.voip_activity && knownCallActive !== true) return false;
     humanizedPointClick(~~(device.getScreenWidth() * 0.5), ~~(device.getScreenHeight() * 0.48), 8);
     sleep(500);
-    if (clickCallControl('挂断')) {
+    if (clickCallControl('挂断') || clickCallControl('取消')) {
         return true;
     }
     const width = device.getScreenWidth(), height = device.getScreenHeight();
@@ -775,7 +775,10 @@ function voiceCallPageState() {
         return null;
     }, function (node) { return node.visible; });
     return {text: stateText || (waitingDesc ? '等待对方接受邀请' : null),
-        hangup: hangupVisible, voip_activity: voipActivity || durationVisible};
+        hangup: hangupVisible, voip_activity: voipActivity || durationVisible,
+        // VideoActivity 和挂断按钮在“等待对方接听”阶段也会出现，只有明确的
+        // “通话中”文本或通话时长节点才能作为真正接通证据。
+        connected: stateText === '通话中' || durationVisible};
 }
 
 function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
@@ -814,15 +817,21 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
     }
 
     const startedAt = time();
-    const ringDeadline = startedAt + Math.max(10, Math.min(120, intOrDefault(payload.ring_timeout_seconds, 45))) * 1000;
-    const callDeadline = Math.min(startedAt + Math.max(10, Math.min(1800, intOrDefault(payload.max_duration_seconds, 60))) * 1000,
-        (taskDeadline || startedAt + 1800000) - 2500);
+    const ringDeadline = startedAt + Math.max(10, Math.min(120,
+        intOrDefault(payload.ring_timeout_seconds, 45))) * 1000;
+    const durationSeconds = Math.max(5, Math.min(1800,
+        intOrDefault(payload.duration_seconds !== undefined ?
+            payload.duration_seconds : payload.max_duration_seconds, 60)));
+    const hardStopDeadline = (taskDeadline || startedAt + 1800000) - 2500;
     let answered = false;
     let endReason = 'remote_ended';
     let verified = false;
+    let connectedAt = 0;
+    let connectedDeadline = 0;
+    let disconnectedPolls = 0;
     let audioState = {microphone_off: false, speaker_off: false};
     let audioConfigured = false;
-    while (time() < callDeadline) {
+    while (time() < hardStopDeadline) {
         if (hasSafetyBlocker()) { endReason = 'account_attention_required'; break; }
         if (shouldPreempt && shouldPreempt()) { endReason = 'scan_preempted'; break; }
         const callState = voiceCallPageState();
@@ -837,23 +846,39 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType) {
         if (state === '对方已拒绝') { endReason = 'declined'; break; }
         if (state === '对方忙线') { endReason = 'busy'; break; }
         if (state === '通话结束') { endReason = 'remote_ended'; break; }
-        if (state === '通话中' || (!state && hangupVisible && time() - startedAt > 2500)) answered = true;
+        if (!answered && callState.connected) {
+            answered = true;
+            connectedAt = time();
+            connectedDeadline = Math.min(connectedAt + durationSeconds * 1000, hardStopDeadline);
+        }
+        if (answered && !callState.voip_activity && !hangupVisible && !state) {
+            disconnectedPolls++;
+            if (disconnectedPolls >= 4) { endReason = 'remote_ended'; break; }
+        } else {
+            disconnectedPolls = 0;
+        }
         if (!answered && time() >= ringDeadline) { endReason = 'ring_timeout'; break; }
+        if (answered && time() >= connectedDeadline) { endReason = 'duration_complete'; break; }
         if (!isWechatForeground()) { endReason = 'wechat_not_foreground'; break; }
         // 控制栏会自动隐藏；节点暂时消失不代表通话已经结束。
         sleep(800);
     }
-    if (time() >= callDeadline) endReason = 'duration_complete';
-    const hungUp = verified ? hangUpVoiceCall(true) : false;
+    if (time() >= hardStopDeadline && answered) endReason = 'duration_complete';
+    const hungUp = answered && endReason === 'remote_ended' ? true :
+        (verified ? hangUpVoiceCall(true) : false);
     sleep(600);
     runtime.currentChatContact = null;
     runtime.chatVerifiedAt = 0;
+    const success = verified && answered && hungUp;
     return {
-        success: verified && hungUp,
+        success: success,
         result: {call_type: callType, dial_started: verified, answered: answered, end_reason: endReason,
-                 elapsed_seconds: ~~((time() - startedAt) / 1000), hung_up: hungUp,
+                 elapsed_seconds: ~~((time() - startedAt) / 1000),
+                 connected_seconds: connectedAt ? ~~((time() - connectedAt) / 1000) : 0,
+                 requested_duration_seconds: durationSeconds, hung_up: hungUp,
                  microphone_off: audioState.microphone_off, speaker_off: audioState.speaker_off},
-        error: !verified ? '拨号页面未验证成功' : !hungUp ? '通话结束后挂断失败' : null
+        error: !verified ? '拨号页面未验证成功' : !answered ? '对方未接听' :
+            !hungUp ? '通话结束后挂断失败' : null
     };
 }
 
@@ -921,8 +946,23 @@ function findIncomingCallCard(width, height) {
 function answerIncomingCall(payload, shouldPreempt, taskDeadline) {
     if (payload.confirm_external !== true) return {success: false, error: '接听通话未明确授权'};
     const width = device.getScreenWidth(), height = device.getScreenHeight();
-    const card = findIncomingCallCard(width, height);
-    if (!card) return {success: false, error: '未视觉确认到完整来电卡片'};
+    const waitSeconds = Math.max(10, Math.min(240,
+        intOrDefault(payload.incoming_wait_seconds, 150)));
+    const waitDeadline = Math.min(time() + waitSeconds * 1000,
+        (taskDeadline || time() + waitSeconds * 1000) - 4000);
+    let card = null;
+    while (time() < waitDeadline && !card) {
+        if (hasSafetyBlocker()) return {success: false, error: '等待来电时账号需要人工处理'};
+        if (shouldPreempt && shouldPreempt()) {
+            return {success: false, preempted: true,
+                result: {end_reason: 'task_preempted'}, error: '任务被抢占'};
+        }
+        card = findIncomingCallCard(width, height);
+        if (!card && time() < waitDeadline) sleep(450);
+    }
+    if (!card) return {success: false,
+        result: {incoming_wait_seconds: waitSeconds, end_reason: 'incoming_call_timeout'},
+        error: '等待期间未视觉确认到完整来电卡片'};
     humanizedPointClick(card.green.x, card.green.y, 5);
     const connected = waitFor(function () { return voiceCallPageState().voip_activity; }, 5000, 250);
     if (!connected) return {success: false, error: '点击接听后未进入通话页面'};
@@ -945,6 +985,7 @@ function answerIncomingCall(payload, shouldPreempt, taskDeadline) {
     return {success: hungUp, preempted: reason === 'preempted',
         result: {answered: true, call_type: payload.call_type || 'any',
             elapsed_seconds: ~~((time() - startedAt) / 1000), end_reason: reason, hung_up: hungUp,
+            call_session_id: payload.call_session_id || null,
             microphone_off: audioState.microphone_off, speaker_off: audioState.speaker_off},
         error: hungUp ? null : '到时挂断失败'};
 }
@@ -997,6 +1038,36 @@ function channelsValidationResult(stage) {
         has_back: evidence.has_back, has_like: evidence.has_like};
 }
 
+function channelsMinorModePromptEvidence(xmlSnapshot) {
+    const xml = xmlSnapshot === undefined ? wechatXmlSnapshot() : (xmlSnapshot || '');
+    const hasSettingEntry = xml.indexOf('text="设置未成年人模式"') >= 0;
+    const hasKnownButton = xml.indexOf('text="我知道了"') >= 0;
+    const hasNeverRemindButton = xml.indexOf('text="不再提醒"') >= 0;
+    const hasMinorText = xml.indexOf('未成年人健康成长') >= 0 ||
+        xml.indexOf('未成年人模式') >= 0;
+    return {present: isWechatForeground(xml) && hasSettingEntry && hasMinorText &&
+            (hasKnownButton || hasNeverRemindButton),
+        has_setting_entry: hasSettingEntry, has_known_button: hasKnownButton,
+        has_never_remind_button: hasNeverRemindButton};
+}
+
+function dismissChannelsMinorModePrompt(deadline) {
+    const evidence = channelsMinorModePromptEvidence();
+    if (!evidence.present) return {present: false, dismissed: false, action: null};
+    // “设置未成年人模式”会改变账号设置，禁止进入。优先点击“不再提醒”；
+    // 仅在该按钮确实不存在时才用“我知道了”关闭本次普通提示。
+    let action = evidence.has_never_remind_button ? 'never_remind' : 'known';
+    const buttonText = action === 'never_remind' ? '不再提醒' : '我知道了';
+    const clicked = retryFreshNode('dismiss_channels_minor_mode_' + action, function () {
+        return text(buttonText).pkg(WX_PACKAGE).getOneNodeInfo(500);
+    }, clickVerifiedNode, 2, 300, deadline);
+    const dismissed = clicked && waitFor(function () {
+        return !channelsMinorModePromptEvidence().present;
+    }, 3000, 200);
+    return {present: true, dismissed: dismissed, action: action,
+        has_never_remind_button: evidence.has_never_remind_button};
+}
+
 function isChannelsPage() {
     return channelsPageEvidence().matched;
 }
@@ -1044,6 +1115,18 @@ function chooseChannelDwellMs(minSeconds, maxSeconds) {
 function browseChannels(payload, shouldPreempt, taskDeadline) {
     const startedAt = time();
     if (!openDiscoverItem('视频号', taskDeadline)) return {success: false, error: '无法进入视频号'};
+    let minorPromptDismissals = 0;
+    let minorPromptFallbacks = 0;
+    let promptOutcome = dismissChannelsMinorModePrompt(taskDeadline);
+    if (promptOutcome.present && !promptOutcome.dismissed) {
+        clickKnownPageBack(detectWechatPage(), taskDeadline);
+        return {success: false, result: {end_reason: 'minor_mode_prompt_dismiss_failed',
+            minor_mode_prompt: promptOutcome}, error: '未成年人模式提示关闭失败'};
+    }
+    if (promptOutcome.dismissed) {
+        minorPromptDismissals++;
+        if (promptOutcome.action !== 'never_remind') minorPromptFallbacks++;
+    }
     if (!waitFor(isChannelsPage, 12000, 300)) {
         const entryValidation = channelsValidationResult('entry');
         clickKnownPageBack(detectWechatPage(), taskDeadline);
@@ -1081,7 +1164,19 @@ function browseChannels(payload, shouldPreempt, taskDeadline) {
     let wallElapsedMs = 0;
     let screenWidth = 0;
     let screenHeight = 0;
+    let nextPromptCheckAt = 0;
     while (time() < deadline && swipes < maxSwipes) {
+        promptOutcome = dismissChannelsMinorModePrompt(taskDeadline);
+        if (promptOutcome.present && !promptOutcome.dismissed) {
+            reason = 'minor_mode_prompt_dismiss_failed';
+            lastValidation = channelsValidationResult('minor_mode_prompt');
+            break;
+        }
+        if (promptOutcome.dismissed) {
+            minorPromptDismissals++;
+            if (promptOutcome.action !== 'never_remind') minorPromptFallbacks++;
+        }
+        nextPromptCheckAt = time() + 3000;
         dwellStartedAt = Number(time());
         plannedDwellMs = Math.min(deadline - dwellStartedAt,
             chooseChannelDwellMs(dwellMin, dwellMax));
@@ -1089,7 +1184,20 @@ function browseChannels(payload, shouldPreempt, taskDeadline) {
         while (time() < waitUntil) {
             if (hasSafetyBlocker()) { reason = 'account_attention_required'; break; }
             if (shouldPreempt && shouldPreempt()) { reason = 'scan_preempted'; break; }
-            sleep(Math.min(1000, waitUntil - time()));
+            if (time() >= nextPromptCheckAt) {
+                promptOutcome = dismissChannelsMinorModePrompt(taskDeadline);
+                nextPromptCheckAt = time() + 3000;
+                if (promptOutcome.present && !promptOutcome.dismissed) {
+                    reason = 'minor_mode_prompt_dismiss_failed';
+                    lastValidation = channelsValidationResult('minor_mode_prompt_during_dwell');
+                    break;
+                }
+                if (promptOutcome.dismissed) {
+                    minorPromptDismissals++;
+                    if (promptOutcome.action !== 'never_remind') minorPromptFallbacks++;
+                }
+            }
+            if (time() < waitUntil) sleep(Math.min(1000, waitUntil - time()));
         }
         if (reason !== 'duration_complete') break;
         actualDwellMs = Number(time()) - dwellStartedAt;
@@ -1152,6 +1260,8 @@ function browseChannels(payload, shouldPreempt, taskDeadline) {
             wall_elapsed_ms: Number(time()) - Number(startedAt),
             last_planned_dwell_ms: plannedDwellMs,
             channels_validation: lastValidation,
+            minor_mode_prompt_dismissals: minorPromptDismissals,
+            minor_mode_prompt_fallbacks: minorPromptFallbacks,
             max_swipes: maxSwipes, swipe_limit_source: explicitSwipeLimit ? 'payload' : 'duration'},
         error: success ? null : reason === 'scan_preempted' ? '扫码任务抢占' : '视频号浏览中断: ' + reason};
 }

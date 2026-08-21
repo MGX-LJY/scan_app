@@ -157,6 +157,7 @@ let config = {
     actionHeartbeatStop: true,
     actionHeartbeatGeneration: 0,
     actionPreemptRequested: false,
+    actionPreemptReason: null,
     scanTerminalDetected: false, // 后台确认扫码成功后立即停止主线程继续识别/点击授权卡片
     lastClaimAuditTaskId: null,
     verifiedActionAccount: null,
@@ -414,6 +415,31 @@ function shouldPreemptWechatAction(taskId) {
     return config.actionPreemptRequested === true;
 }
 
+function buildWechatPreemptOutcome() {
+    const reason = String(config.actionPreemptReason || 'task_preempted');
+    const scanPreempt = reason.indexOf('scan_task_arrived:') === 0 ||
+        reason === '扫码任务到达';
+    const manualPreempt = reason.indexOf('manual_') === 0;
+    const inboundPreempt = reason.indexOf('inbound_message:') === 0;
+    const endReason = scanPreempt ? 'scan_preempted' : 'task_preempted';
+    const error = scanPreempt ? '扫码任务抢占' :
+        manualPreempt ? '任务被人工中断' :
+            inboundPreempt ? '收到消息，当前任务已让位' : '任务被服务器抢占';
+    return {success: false, preempted: true, error: error,
+        result: {end_reason: endReason, preempt_reason: reason}};
+}
+
+function normalizeWechatPreemptOutcome(outcome) {
+    if (!outcome || outcome.preempted !== true) return outcome;
+    const normalized = buildWechatPreemptOutcome();
+    outcome.success = false;
+    outcome.error = normalized.error;
+    outcome.result = outcome.result || {};
+    outcome.result.end_reason = normalized.result.end_reason;
+    outcome.result.preempt_reason = normalized.result.preempt_reason;
+    return outcome;
+}
+
 function savePendingActionResult(task, outcome, phase) {
     try {
         const persistedTask = JSON.parse(JSON.stringify(task || {}));
@@ -511,6 +537,7 @@ function flushPendingActionResult() {
 function startWechatActionHeartbeat(task) {
     config.actionHeartbeatStop = false;
     config.actionPreemptRequested = false;
+    config.actionPreemptReason = null;
     const heartbeatGeneration = ++config.actionHeartbeatGeneration;
     thread.execAsync(function () {
         let nextHeartbeatAt = time() + 15000;
@@ -531,7 +558,11 @@ function startWechatActionHeartbeat(task) {
                         if (ret.task) {
                             task.deadline = ret.task.soft_deadline;
                             task.hard_deadline = ret.task.hard_deadline;
-                            if (ret.preempt === true) config.actionPreemptRequested = true;
+                            if (ret.preempt === true) {
+                                config.actionPreemptRequested = true;
+                                config.actionPreemptReason = ret.preempt_reason ||
+                                    ret.task.preempt_reason || 'task_preempted';
+                            }
                         }
                     }
                     nextHeartbeatAt = time() + 15000;
@@ -621,7 +652,7 @@ function processWechatAction(task) {
             }
         }
         if (accountResult === 'preempted') {
-            const preemptOutcome = {success: false, preempted: true, error: '扫码任务抢占'};
+            const preemptOutcome = buildWechatPreemptOutcome();
             if (!savePendingActionResult(task, preemptOutcome, 'result_pending')) return false;
             flushPendingActionResult();
             return false;
@@ -637,7 +668,7 @@ function processWechatAction(task) {
             return false;
         }
         if (config.actionPreemptRequested) {
-            const latePreemptOutcome = {success: false, preempted: true, error: '扫码任务抢占'};
+            const latePreemptOutcome = buildWechatPreemptOutcome();
             if (!savePendingActionResult(task, latePreemptOutcome, 'result_pending')) return false;
             flushPendingActionResult();
             return false;
@@ -681,6 +712,7 @@ function processWechatAction(task) {
         } catch (e) {
             outcome = {success: false, error: '动作执行异常: ' + e};
         }
+        outcome = normalizeWechatPreemptOutcome(outcome);
         const needsWechatHome = task.action_type !== 'device_sleep' &&
             task.action_type !== 'device_wake' && task.action_type !== 'account_login';
         if (needsWechatHome) {
@@ -747,6 +779,7 @@ function processWechatAction(task) {
     } finally {
         config.actionHeartbeatStop = true;
         config.actionPreemptRequested = false;
+        config.actionPreemptReason = null;
         try { releaseNode(); } catch (ignoreRelease) {}
         config.pauseResultWatcher = false;
         config.actionInProgress = false;
