@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":173,
+"version":175,
 "dialog":false,
-"msg": "修复长通话接通同步与45秒误判",
+"msg": "优化日程时段与连续聊天扫码抢占",
 "force": true,
-"md5":"c74b61886afba8733a5b407e20369f51",
+"md5":"2296379dd7caae6c94da807041fd98aa",
 "download_timeout":300
 }
