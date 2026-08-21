@@ -91,14 +91,15 @@ adb install build/release.iec
 
 ### 服务器端点
 
-**基础URL**: `https://scan.mgxnet.com/api/`
+**基础URL**: `https://scan.mgxnet.com`
 
 #### 1. 设备注册
 ```http
-POST /phone/login
+POST /api/wechat/v1/devices/register
 Content-Type: application/json
 
 {
+  "device_id": "设备ID",
   "phone_id": "设备ID",
   "wechat_accounts": ["账号1", "账号2"]
 }
@@ -106,29 +107,37 @@ Content-Type: application/json
 
 #### 2. 获取任务
 ```http
-GET /scan/task?phone_id={设备ID}
+GET /api/wechat/v1/tasks/claim?device_id={设备ID}
 
 Response:
 {
-  "task_id": "任务ID",
-  "qr_code": "base64编码的二维码图片",
-  "account": "指定使用的微信账号"
+  "success": true,
+  "has_task": true,
+  "task": {
+    "task_id": "任务ID",
+    "task_type": "scan_qr",
+    "payload": {"qrcode_base64": "base64编码的二维码图片"}
+  }
 }
 ```
 
 #### 3. 上报结果
 ```http
-POST /scan/result
+POST /api/wechat/v1/tasks/{task_id}/result
 Content-Type: application/json
 
 {
   "task_id": "任务ID",
   "phone_id": "设备ID",
-  "status": "success/failed",
-  "message": "结果描述",
-  "timestamp": 1234567890
+  "device_id": "设备ID",
+  "dispatch_token": "领取时返回的租约令牌",
+  "status": "completed/failed",
+  "success": true,
+  "result": {}
 }
 ```
+
+同一个领取接口也可能返回聊天、视频号、朋友圈、通话、切号或登录任务。服务器始终先检查扫码任务；二维码仍按 Base64 下发，手机端原有相册保存和微信扫码状态机保持不变。
 
 ## 📁 项目结构
 

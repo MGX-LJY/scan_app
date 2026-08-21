@@ -153,6 +153,9 @@ let config = {
     pauseResultWatcher: false, // 主线程操作系统设置时暂停后台节点查询，避免节点缓存竞态
     updateInProgress: false,  // 热更新检查/下载期间暂停领取新任务
     pollingTask: false,       // 正在请求扫码任务，防止更新与任务分配竞态
+    pendingUnifiedTask: null, // 单一claim领取的普通任务，只允许当前主循环消费一次
+    deviceRegistered: false,
+    currentTaskId: null,
     actionInProgress: false,  // 正在执行低优先级微信动作，禁止热更新并发重启
     actionHeartbeatStop: true,
     actionHeartbeatGeneration: 0,
@@ -207,6 +210,39 @@ function flushPhoneAuditLogs() {
         logw('上报手机审计日志失败，保留等待补报: ' + e);
         return false;
     }
+}
+
+function startDeviceStatusHeartbeat() {
+    thread.execAsync(function () {
+        let failureCount = 0;
+        while (true) {
+            if (config.deviceRegistered && !config.updateInProgress) {
+                try {
+                    const response = JSON.parse(http.postJSON(
+                        config.baseUrl + '/api/wechat/v1/devices/heartbeat',
+                        JSON.stringify({
+                            device_id: config.deviceId,
+                            app_version: config.version,
+                            runtime_mode: config.runtimeMode,
+                            current_task_id: config.currentTaskId,
+                            active_account_id: config.verifiedActionAccount
+                        }), 8000, null));
+                    if (response.success) {
+                        failureCount = 0;
+                    } else {
+                        failureCount++;
+                    }
+                } catch (heartbeatError) {
+                    failureCount++;
+                    // 服务器关闭期间不每15秒刷红日志；首次及每10次保留一条诊断。
+                    if (failureCount === 1 || failureCount % 10 === 0) {
+                        logw('设备心跳暂时失败(' + failureCount + '): ' + heartbeatError);
+                    }
+                }
+            }
+            sleep(15000);
+        }
+    });
 }
 try {
     config.verifiedActionAccount = wechatActionStorage.getString('active_account_id', '') || null;
@@ -276,9 +312,11 @@ function base64ToBitmap(base64Str, taskId) {
 }
 
 function login(deviceId, wxArr) {
-    const url = `${config.baseUrl}/api/phone/login`;
+    config.deviceRegistered = false;
+    const url = `${config.baseUrl}/api/wechat/v1/devices/register`;
     const data = JSON.stringify({
         "phone_id": deviceId,           // 必填，手机唯一ID
+        "device_id": deviceId,          // 统一接口稳定字段
         "wechat_accounts": wxArr,  // 必填，微信号列表arr类型
         "app_version": config.version,
         "script_session_id": config.scriptSessionId,
@@ -291,6 +329,7 @@ function login(deviceId, wxArr) {
             logd(res);
             let ret = JSON.parse(res);
             if (ret.success) {
+                config.deviceRegistered = true;
                 toast('登录成功');
                 return true;
             } else {
@@ -311,7 +350,7 @@ function getScan(deviceId) {
     //     taskId: 'task_006',
     //     wxName: 'lllyyy8588'
     // }
-    const url = `${config.baseUrl}/api/scan/task?phone_id=${deviceId}`;
+    const url = `${config.baseUrl}/api/wechat/v1/tasks/claim?device_id=${deviceId}`;
     if (config.updateInProgress) {
         logi('热更新检查中，暂停领取扫码任务');
         return null;
@@ -321,21 +360,30 @@ function getScan(deviceId) {
         let res = http.httpGetDefault(url, 15000, null);
             // logd(res);
             let ret = JSON.parse(res);
-            if (ret.success && ret.has_task) {
+            if (ret.success && ret.has_task && ret.task) {
+                if (ret.task.task_type !== 'scan_qr') {
+                    // 单一领取接口也会返回聊天、视频号等普通任务；保留对象给
+                    // 当前主循环处理，严禁为了分类再次请求服务器造成重复领取。
+                    config.pendingUnifiedTask = ret.task;
+                    return null;
+                }
                 // 收到任务后立即进入处理中状态，关闭热更新窗口。
                 config.step = 2;
+                const scanPayload = ret.task.payload || {};
                 return {
-                    base64Str: ret.task.qrcode_base64,
+                    base64Str: scanPayload.qrcode_base64,
                     taskId: ret.task.task_id,
-                    wxName: ret.task.wechat_nickname,
-                    accountId: ret.task.account_id || ret.task.wechat_nickname,
+                    wxName: ret.task.wechat_name || scanPayload.wechat_nickname,
+                    accountId: ret.task.account_id || ret.task.wechat_name ||
+                        scanPayload.wechat_nickname,
                     dispatchToken: ret.task.dispatch_token,
                     ackRequired: ret.task.ack_required === true,
-                    accountPrepared: ret.task.account_prepared === true,
+                    accountPrepared: scanPayload.account_prepared === true,
                     // 服务端活跃任务窗口为5分钟，手机端预留约30秒给最终结果上报。
                     taskDeadline: time() + 270000
                 }
             } else if (ret.success && ret.registration_required === true) {
+                config.deviceRegistered = false;
                 config.stepZeroReason = 'server_requested_reregistration';
                 config.step = 0;
                 logw('服务器要求重新注册，自动返回注册步骤');
@@ -354,12 +402,9 @@ function getScan(deviceId) {
 
 function getWechatActionTask() {
     try {
-        let unifiedRes = http.httpGetDefault(
-            `${config.baseUrl}/api/wechat/v1/tasks/claim?device_id=${config.deviceId}`,
-            10000, null);
-        let unifiedRet = JSON.parse(unifiedRes);
-        if (unifiedRet.success && unifiedRet.has_task && unifiedRet.task) {
-            let unifiedTask = unifiedRet.task;
+        let unifiedTask = config.pendingUnifiedTask;
+        config.pendingUnifiedTask = null;
+        if (unifiedTask) {
             unifiedTask.protocol = 'unified_v1';
             unifiedTask.action_type = unifiedTask.task_type;
             // account_id 是服务器稳定编号；wechat_name 是手机微信界面真实昵称。
@@ -613,6 +658,10 @@ function saveUnifiedActionCheckpoint(task, outcome) {
 function processWechatAction(task) {
     config.actionInProgress = true;
     config.pauseResultWatcher = true;
+    config.currentTaskId = task.task_id;
+    if (task.action_type !== 'device_sleep' && task.action_type !== 'device_wake') {
+        config.runtimeMode = 'social';
+    }
     try {
         const actionStartedAt = time();
         queuePhoneAudit(task, 'action_processing_started', 'processing', 'info',
@@ -783,6 +832,8 @@ function processWechatAction(task) {
         try { releaseNode(); } catch (ignoreRelease) {}
         config.pauseResultWatcher = false;
         config.actionInProgress = false;
+        config.currentTaskId = null;
+        if (config.runtimeMode !== 'sleep') config.runtimeMode = 'idle';
     }
 }
 
@@ -803,11 +854,16 @@ function pollAndProcessWechatAction() {
 }
 
 function ackScanTask(taskConfig) {
-    if (!taskConfig.ackRequired) return true;
-    const url = `${config.baseUrl}/api/scan/task/ack`;
+    if (!taskConfig.ackRequired) {
+        config.currentTaskId = taskConfig.taskId;
+        config.runtimeMode = 'scan';
+        return true;
+    }
+    const url = `${config.baseUrl}/api/wechat/v1/tasks/${taskConfig.taskId}/ack`;
     const data = JSON.stringify({
         task_id: taskConfig.taskId,
         phone_id: config.deviceId,
+        device_id: config.deviceId,
         dispatch_token: taskConfig.dispatchToken
     });
     for (let i = 0; i < 4; i++) {
@@ -815,6 +871,8 @@ function ackScanTask(taskConfig) {
             let res = http.postJSON(url, data, 8000, null);
             let ret = JSON.parse(res);
             if (ret.success) {
+                config.currentTaskId = taskConfig.taskId;
+                config.runtimeMode = 'scan';
                 // 服务器从ACK时刻开始计时；本地再预留10秒，saoma内部另预留20秒上报时间。
                 if (ret.task_deadline) taskConfig.taskDeadline = ret.task_deadline - 10000;
                 return true;
@@ -829,15 +887,23 @@ function ackScanTask(taskConfig) {
 }
 
 function upResult(taskConfig, result = true, error = null, errorCode = null) {
-    const url = `${config.baseUrl}/api/scan/result`;
+    const url = `${config.baseUrl}/api/wechat/v1/tasks/${taskConfig.taskId}/result`;
     const data = JSON.stringify({
         "task_id": taskConfig.taskId,              // 必填，任务ID
         "phone_id": config.deviceId,            // 必填，手机ID
+        "device_id": config.deviceId,           // 统一接口稳定字段
+        "dispatch_token": taskConfig.dispatchToken,
+        "status": result ? "completed" : "failed",
         "success": result,                    // 必填，扫码是否成功
         "wechat_nickname": taskConfig.wxName, // 选填，扫码成功时的微信昵称
         "scan_time": time(),                    // 必填，扫码时间戳(毫秒)
         "error": error,                      // 选填，失败原因(成功时为null)
-        "error_code": errorCode              // 机器可读状态，供服务端阻止重复扫码
+        "error_code": errorCode,             // 机器可读状态，供服务端阻止重复扫码
+        "result": {
+            "error": error,
+            "error_code": errorCode,
+            "scan_time": time()
+        }
     });
     for (let i = 0; i < 5; i++) {
         try {
@@ -847,6 +913,8 @@ function upResult(taskConfig, result = true, error = null, errorCode = null) {
             logd(res);
             let ret = JSON.parse(res);
             if (ret.success) {
+                config.currentTaskId = null;
+                if (config.runtimeMode !== 'sleep') config.runtimeMode = 'idle';
                 toast('上报完成');
                 // exit()
                 return true;
@@ -864,10 +932,11 @@ function upResult(taskConfig, result = true, error = null, errorCode = null) {
 
 function upStepLog(taskId, step, msg, level = 'info') {
     if (!taskId) return true;
-    const url = `${config.baseUrl}/api/scan/step_log`;
+    const url = `${config.baseUrl}/api/wechat/v1/tasks/${taskId}/logs`;
     const data = JSON.stringify({
         task_id: taskId,
         phone_id: config.deviceId,
+        device_id: config.deviceId,
         step: step,
         message: msg,
         level: level,
@@ -1762,6 +1831,7 @@ function main() {
     clearLog(-1);
     shell.execCommand('settings put global block_untrusted_touches 0');//设置点击穿透
     shell.execCommand('am compat disable BLOCK_UNTRUSTED_TOUCHES ' + jc.App.getMyAppPkgName());//设置点击穿透
+    startDeviceStatusHeartbeat();
 
     // 12台手机按设备ID错峰0~119秒检查，之后每5分钟检查一次。
     let updateStagger = 0;
