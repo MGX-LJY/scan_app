@@ -974,6 +974,16 @@ function pairedCallConnectedEvidence(payload, directPeer) {
         String(peer.evidence || 'connected'), peer_task_id: peer.task_id || null};
 }
 
+function pairedCallTerminalEvidence(payload, directPeer) {
+    const peer = directPeer || config.actionCallPeer;
+    const expectedSession = String(payload.call_session_id || '');
+    if (!peer || !expectedSession ||
+            String(peer.call_session_id || '') !== expectedSession) return null;
+    const status = String(peer.status || '');
+    if (['preempted', 'cancelled', 'failed', 'expired'].indexOf(status) < 0) return null;
+    return {status: status, peer_task_id: peer.task_id || null};
+}
+
 function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType, task) {
     const isVideo = callType === 'video';
     const callLabel = isVideo ? '视频通话' : '语音通话';
@@ -1016,10 +1026,11 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType, task) 
     // 仅在最后一次同步查询也失败时，最多追加8秒证据确认窗口。
     const ringEvidenceDeadline = Math.min(ringDeadline + 8000,
         (taskDeadline || ringDeadline + 8000) - 2500);
-    const durationSeconds = Math.max(5, Math.min(1800,
+    const durationSeconds = Math.max(5, Math.min(3600,
         intOrDefault(payload.duration_seconds !== undefined ?
             payload.duration_seconds : payload.max_duration_seconds, 60)));
-    const hardStopDeadline = (taskDeadline || startedAt + 1800000) - 2500;
+    const hardStopDeadline = (taskDeadline ||
+        startedAt + (durationSeconds + 180) * 1000) - 2500;
     let answered = false;
     let endReason = 'remote_ended';
     let verified = false;
@@ -1056,6 +1067,14 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType, task) 
         }
         peerConnected = pairedCallConnectedEvidence(payload,
             peerProbe && peerProbe.success ? peerProbe.peer : null);
+        const peerTerminal = pairedCallTerminalEvidence(payload,
+            peerProbe && peerProbe.success ? peerProbe.peer : null);
+        if (!answered && peerTerminal) {
+            endReason = (peerTerminal.status === 'preempted' ||
+                peerTerminal.status === 'cancelled') ?
+                'peer_task_preempted' : 'peer_task_failed';
+            break;
+        }
         if (!answered && (callState.connected || peerConnected)) {
             answered = true;
             // 同一call_session_id下被叫端的接通证明也证明拨号动作真实发生。
@@ -1122,6 +1141,7 @@ function makeOutgoingCall(payload, shouldPreempt, taskDeadline, callType, task) 
     const success = verified && answered && hungUp;
     return {
         success: success,
+        preempted: endReason === 'scan_preempted' || endReason === 'peer_task_preempted',
         result: {call_type: callType, dial_started: verified, answered: answered, end_reason: endReason,
                  elapsed_seconds: ~~((time() - startedAt) / 1000),
                  connected_seconds: connectedAt ? ~~((time() - connectedAt) / 1000) : 0,
@@ -1219,6 +1239,15 @@ function answerIncomingCall(payload, shouldPreempt, taskDeadline, task) {
             return {success: false, preempted: true,
                 result: {end_reason: 'task_preempted'}, error: '任务被抢占'};
         }
+        const peerTerminal = pairedCallTerminalEvidence(payload, config.actionCallPeer);
+        if (peerTerminal) {
+            const peerPreempted = peerTerminal.status === 'preempted' ||
+                peerTerminal.status === 'cancelled';
+            return {success: false, preempted: peerPreempted,
+                result: {end_reason: peerPreempted ?
+                    'peer_task_preempted' : 'peer_task_failed'},
+                error: peerPreempted ? '拨打端任务已让位' : '拨打端任务已结束'};
+        }
         card = findIncomingCallCard(width, height);
         if (!card && time() < waitDeadline) sleep(450);
     }
@@ -1261,7 +1290,7 @@ function answerIncomingCall(payload, shouldPreempt, taskDeadline, task) {
     }
     const startedAt = time();
     const audioState = ensureCallAudioMuted();
-    const duration = Math.max(5, Math.min(1800,
+    const duration = Math.max(5, Math.min(3600,
         intOrDefault(payload.duration_seconds || payload.max_duration_seconds, 60)));
     const nominalDeadline = startedAt + duration * 1000;
     // 拨打方是计划通话的默认挂断方。接听方多等8秒观察远端结束，
