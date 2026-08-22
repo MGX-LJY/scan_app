@@ -11,7 +11,8 @@ const runtime = {
     chatVerifiedAt: 0,
     lastTextInputFailure: null,
     lastContactFailure: null,
-    lastCallHangupMethod: null
+    lastCallHangupMethod: null,
+    lastChannelsEntry: null
 };
 
 function wechatXmlSnapshot() {
@@ -1455,6 +1456,73 @@ function openDiscoverItem(item, deadline) {
         clickVerifiedNode, 3, 500, deadline);
 }
 
+function nodeBoundsSnapshot(node) {
+    const bounds = node && node.bounds || {};
+    const left = boundsValue(bounds, 'left', 'l');
+    const top = boundsValue(bounds, 'top', 't');
+    const right = boundsValue(bounds, 'right', 'r');
+    const bottom = boundsValue(bounds, 'bottom', 'b');
+    if ([left, top, right, bottom].some(function (value) { return value === undefined; })) {
+        return null;
+    }
+    return {left: left, top: top, right: right, bottom: bottom,
+        width: right - left, height: bottom - top};
+}
+
+function discoverClickBoundsAllowed(candidate, original) {
+    if (!candidate || !original || candidate.width < 4 || candidate.height < 4) return false;
+    const width = device.getScreenWidth(), height = device.getScreenHeight();
+    const containsText = candidate.left <= original.left && candidate.top <= original.top &&
+        candidate.right >= original.right && candidate.bottom >= original.bottom;
+    return containsText && candidate.left >= 0 && candidate.right <= width &&
+        candidate.top >= height * 0.07 && candidate.bottom <= height * 0.9 &&
+        candidate.height <= Math.max(220, height * 0.16);
+}
+
+/**
+ * 只点击“发现”页中包含精确文字节点的行级控件。通用 clickVerifiedNode 会继续
+ * 向上寻找可点击父节点；若微信把整个列表容器标为 clickable，随机中心点可能
+ * 落到另一行。这里拒绝过高的父节点，并把每次真实落点依据写入诊断结果。
+ */
+function clickDiscoverItemOnce(item, deadline) {
+    let node = null, current = null, original = null, candidate = null;
+    let depth = 0, clicked = false, mode = 'none', selectedBounds = null;
+    try {
+        if (deadline && time() >= deadline) {
+            return {clicked: false, reason: 'entry_deadline_reached'};
+        }
+        node = visibleText(item, 900);
+        if (!node) return {clicked: false, reason: 'node_missing'};
+        original = nodeBoundsSnapshot(node);
+        if (!discoverClickBoundsAllowed(original, original)) {
+            return {clicked: false, reason: 'text_bounds_invalid', text_bounds: original};
+        }
+        current = node;
+        for (depth = 0; current && depth < 6; depth++) {
+            candidate = nodeBoundsSnapshot(current);
+            if (current.clickable && discoverClickBoundsAllowed(candidate, original)) {
+                selectedBounds = candidate;
+                clicked = clickNodeSafeArea(current);
+                mode = depth === 0 ? 'node' : 'parent_' + depth;
+                if (clicked) break;
+            }
+            current = current.parent();
+        }
+        if (!clicked) {
+            selectedBounds = original;
+            clicked = clickNodeSafeArea(node);
+            mode = 'text_fallback';
+        }
+        return {clicked: clicked, reason: clicked ? 'click_injected' : 'click_failed',
+            click_mode: mode, text_bounds: original, click_bounds: selectedBounds};
+    } catch (entryClickError) {
+        return {clicked: false, reason: 'click_exception', error: String(entryClickError),
+            text_bounds: original, click_bounds: selectedBounds};
+    } finally {
+        releaseNode();
+    }
+}
+
 function channelsPageEvidence(xmlSnapshot) {
     const xml = xmlSnapshot === undefined ? wechatXmlSnapshot() : (xmlSnapshot || '');
     const activity = runningWechatActivity();
@@ -1479,6 +1547,123 @@ function channelsValidationResult(stage) {
         activity: evidence.activity, finder_home_activity: evidence.finder_home_activity,
         has_following: evidence.has_following, has_recommend: evidence.has_recommend,
         has_back: evidence.has_back, has_like: evidence.has_like};
+}
+
+function channelsEntryHasBlocker(xml) {
+    const source = xml || '';
+    const blockers = ['登录', '手机号登录', '微信安全中心', '安全验证', '请输入验证码'];
+    for (let index = 0; index < blockers.length; index++) {
+        if (source.indexOf('text="' + blockers[index] + '"') >= 0) return blockers[index];
+    }
+    return null;
+}
+
+/**
+ * 视频号入口以“页面验证成功”为完成条件，而不是以 clickPoint() 的布尔值为准。
+ * 每轮都重新回到发现页、重新抓节点、重新点击；转场期间同时处理延迟出现的
+ * 未成年人提示。总入口预算有界，避免吞掉后续浏览与恢复首页的时间。
+ */
+function enterChannelsVerified(taskDeadline) {
+    const startedAt = time();
+    const entryDeadline = Math.min(taskDeadline || startedAt + 26000, startedAt + 26000);
+    const attempts = [];
+    let minorPromptDismissals = 0, minorPromptFallbacks = 0;
+    let attempt = 0, discoverReady = false, clickResult = null;
+    let transitionDeadline = 0, xml = '', evidence = null, promptOutcome = null;
+    let blocker = null, outcome = 'channels_entry_transition_timeout';
+    for (attempt = 1; attempt <= 3 && time() < entryDeadline; attempt++) {
+        if (isChannelsPage()) {
+            evidence = channelsPageEvidence();
+            attempts.push({attempt: attempt, result: 'already_open', after: evidence,
+                elapsed_ms: time() - startedAt});
+            runtime.lastChannelsEntry = {success: true, attempts: attempts,
+                minor_mode_prompt_dismissals: minorPromptDismissals,
+                minor_mode_prompt_fallbacks: minorPromptFallbacks};
+            return runtime.lastChannelsEntry;
+        }
+        discoverReady = mainTab('发现', entryDeadline);
+        if (!discoverReady) {
+            evidence = channelsPageEvidence();
+            attempts.push({attempt: attempt, result: 'discover_tab_unavailable',
+                after: evidence, elapsed_ms: time() - startedAt});
+            outcome = evidence.foreground ? 'channels_entry_discover_unavailable' :
+                'channels_entry_external_page';
+            if (!evidence.foreground) break;
+            continue;
+        }
+        clickResult = clickDiscoverItemOnce('视频号', entryDeadline);
+        if (!clickResult.clicked) {
+            evidence = channelsPageEvidence();
+            outcome = clickResult.reason === 'node_missing' ? 'channels_entry_node_missing' :
+                'channels_entry_click_failed';
+            attempts.push({attempt: attempt, result: outcome, click: clickResult,
+                after: evidence, elapsed_ms: time() - startedAt});
+            logw('视频号入口尝试失败 ' + JSON.stringify(attempts[attempts.length - 1]));
+            if (time() < entryDeadline) humanPause(350, 800);
+            continue;
+        }
+        transitionDeadline = Math.min(entryDeadline, time() + 6000);
+        outcome = 'channels_entry_transition_timeout';
+        while (time() < transitionDeadline) {
+            xml = wechatXmlSnapshot();
+            evidence = channelsPageEvidence(xml);
+            if (evidence.matched) {
+                attempts.push({attempt: attempt, result: 'entered', click: clickResult,
+                    after: evidence, elapsed_ms: time() - startedAt});
+                runtime.lastChannelsEntry = {success: true, attempts: attempts,
+                    minor_mode_prompt_dismissals: minorPromptDismissals,
+                    minor_mode_prompt_fallbacks: minorPromptFallbacks,
+                    final_evidence: evidence};
+                logi('视频号入口验证成功 ' + JSON.stringify(runtime.lastChannelsEntry));
+                return runtime.lastChannelsEntry;
+            }
+            promptOutcome = channelsMinorModePromptEvidence(xml);
+            if (promptOutcome.present) {
+                promptOutcome = dismissChannelsMinorModePrompt(transitionDeadline);
+                if (!promptOutcome.dismissed) {
+                    attempts.push({attempt: attempt,
+                        result: 'minor_mode_prompt_dismiss_failed', click: clickResult,
+                        prompt: promptOutcome, after: evidence,
+                        elapsed_ms: time() - startedAt});
+                    runtime.lastChannelsEntry = {success: false,
+                        end_reason: 'minor_mode_prompt_dismiss_failed', attempts: attempts,
+                        minor_mode_prompt_dismissals: minorPromptDismissals,
+                        minor_mode_prompt_fallbacks: minorPromptFallbacks,
+                        final_evidence: evidence};
+                    return runtime.lastChannelsEntry;
+                }
+                minorPromptDismissals++;
+                if (promptOutcome.action !== 'never_remind') minorPromptFallbacks++;
+                continue;
+            }
+            blocker = channelsEntryHasBlocker(xml);
+            if (blocker) {
+                outcome = 'channels_entry_account_blocked';
+                break;
+            }
+            if (!evidence.foreground) {
+                outcome = 'channels_entry_external_page';
+                break;
+            }
+            sleep(300);
+        }
+        evidence = channelsPageEvidence();
+        if (outcome === 'channels_entry_transition_timeout' &&
+                evidence.activity.indexOf('LauncherUI') >= 0) {
+            outcome = 'channels_entry_click_not_effective';
+        }
+        attempts.push({attempt: attempt, result: outcome, click: clickResult,
+            blocker: blocker, after: evidence, elapsed_ms: time() - startedAt});
+        logw('视频号入口未完成 ' + JSON.stringify(attempts[attempts.length - 1]));
+        if (outcome === 'channels_entry_external_page' ||
+                outcome === 'channels_entry_account_blocked') break;
+        if (time() < entryDeadline) humanPause(400, 900);
+    }
+    runtime.lastChannelsEntry = {success: false, end_reason: outcome,
+        attempts: attempts, minor_mode_prompt_dismissals: minorPromptDismissals,
+        minor_mode_prompt_fallbacks: minorPromptFallbacks,
+        final_evidence: evidence || channelsPageEvidence(), elapsed_ms: time() - startedAt};
+    return runtime.lastChannelsEntry;
 }
 
 function channelsMinorModePromptEvidence(xmlSnapshot) {
@@ -1557,25 +1742,18 @@ function chooseChannelDwellMs(minSeconds, maxSeconds) {
 
 function browseChannels(payload, shouldPreempt, taskDeadline) {
     const startedAt = time();
-    if (!openDiscoverItem('视频号', taskDeadline)) return {success: false, error: '无法进入视频号'};
-    let minorPromptDismissals = 0;
-    let minorPromptFallbacks = 0;
-    let promptOutcome = dismissChannelsMinorModePrompt(taskDeadline);
-    if (promptOutcome.present && !promptOutcome.dismissed) {
+    const entryOutcome = enterChannelsVerified(taskDeadline);
+    if (!entryOutcome.success) {
         clickKnownPageBack(detectWechatPage(), taskDeadline);
-        return {success: false, result: {end_reason: 'minor_mode_prompt_dismiss_failed',
-            minor_mode_prompt: promptOutcome}, error: '未成年人模式提示关闭失败'};
+        return {success: false, result: {end_reason: entryOutcome.end_reason,
+            channels_entry: entryOutcome,
+            channels_validation: channelsValidationResult('entry')},
+            error: entryOutcome.end_reason === 'minor_mode_prompt_dismiss_failed' ?
+                '未成年人模式提示关闭失败' : '视频号入口验证失败'};
     }
-    if (promptOutcome.dismissed) {
-        minorPromptDismissals++;
-        if (promptOutcome.action !== 'never_remind') minorPromptFallbacks++;
-    }
-    if (!waitFor(isChannelsPage, 12000, 300)) {
-        const entryValidation = channelsValidationResult('entry');
-        clickKnownPageBack(detectWechatPage(), taskDeadline);
-        return {success: false, result: {end_reason: 'channels_entry_validation_failed',
-            channels_validation: entryValidation}, error: '视频号页面校验失败'};
-    }
+    let minorPromptDismissals = entryOutcome.minor_mode_prompt_dismissals || 0;
+    let minorPromptFallbacks = entryOutcome.minor_mode_prompt_fallbacks || 0;
+    let promptOutcome = null;
     const duration = Math.max(5, Math.min(3600, intOrDefault(payload.duration_seconds, 60)));
     const dwellMin = Math.max(5, Math.min(120, intOrDefault(payload.dwell_min_seconds, 15)));
     const dwellMax = Math.max(dwellMin, Math.min(180, intOrDefault(payload.dwell_max_seconds, 30)));
