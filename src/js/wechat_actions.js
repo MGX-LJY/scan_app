@@ -50,6 +50,86 @@ function isWechatForeground(xmlSnapshot) {
     return xml.indexOf('pkg="' + WX_PACKAGE + '"') >= 0;
 }
 
+function readWechatForegroundEvidence() {
+    let pkg = null;
+    try { pkg = getRunningPkg(); } catch (pkgError) {}
+    const activity = runningWechatActivity();
+    const xml = wechatXmlSnapshot();
+    const normalizedPkg = pkg === null || pkg === undefined ? '' : String(pkg);
+    let verified = false, method = 'none';
+    if (normalizedPkg === WX_PACKAGE) {
+        verified = true;
+        method = 'package';
+    } else if (normalizedPkg.length > 0) {
+        method = 'external_package';
+    } else if (activity.indexOf(WX_PACKAGE) >= 0) {
+        verified = true;
+        method = 'activity';
+    } else if (activity && activity.charAt(0) !== '.' && activity.indexOf('.') >= 0) {
+        method = 'external_activity';
+    } else if (xml.indexOf('pkg="' + WX_PACKAGE + '"') >= 0) {
+        verified = true;
+        method = 'xml';
+    }
+    return {
+        verified: verified,
+        method: method,
+        package_name: normalizedPkg || null,
+        activity: activity || null,
+        xml_has_wechat: xml.indexOf('pkg="' + WX_PACKAGE + '"') >= 0
+    };
+}
+
+function ensureWechatForegroundForWake() {
+    const startedAt = time();
+    const timeoutMs = 12000;
+    let attempts = 0, consecutive = 0, openRequested = false, openAttempts = 0;
+    let openError = null, lastEvidence = null;
+    lastEvidence = readWechatForegroundEvidence();
+    attempts++;
+    consecutive = lastEvidence.verified ? 1 : 0;
+    if (!lastEvidence.verified) {
+        openRequested = true;
+        openAttempts++;
+        try {
+            utils.openApp(WX_PACKAGE);
+        } catch (wakeOpenError) {
+            openError = String(wakeOpenError);
+        }
+    }
+    const deadline = startedAt + timeoutMs;
+    while (time() < deadline) {
+        sleep(300);
+        lastEvidence = readWechatForegroundEvidence();
+        attempts++;
+        consecutive = lastEvidence.verified ? consecutive + 1 : 0;
+        if (consecutive >= 2) {
+            lastEvidence.page = detectWechatPage();
+            return {success: true, runtime_mode: 'idle',
+                already_foreground: !openRequested, open_requested: openRequested,
+                open_attempts: openAttempts, attempts: attempts,
+                elapsed_ms: time() - startedAt,
+                verification: lastEvidence, open_error: openError};
+        }
+        if (!lastEvidence.verified && openAttempts < 2 &&
+                time() - startedAt >= 4000) {
+            openRequested = true;
+            openAttempts++;
+            try {
+                utils.openApp(WX_PACKAGE);
+            } catch (wakeRetryError) {
+                openError = String(wakeRetryError);
+            }
+        }
+    }
+    lastEvidence.page = WX_PAGE.OTHER;
+    return {success: false, runtime_mode: 'idle',
+        already_foreground: false, open_requested: openRequested,
+        open_attempts: openAttempts, attempts: attempts,
+        elapsed_ms: time() - startedAt,
+        verification: lastEvidence, open_error: openError};
+}
+
 function countXmlOccurrences(xml, token) {
     if (!xml || !token) return 0;
     let count = 0, offset = 0;
@@ -1965,11 +2045,10 @@ function execute(task, shouldPreempt) {
         return {success: true, result: {runtime_mode: 'sleep'}};
     }
     if (task.action_type === 'device_wake') {
-        utils.openApp(WX_PACKAGE);
-        sleep(1000);
-        const foreground = isWechatForeground();
-        return {success: foreground,
-            result: {runtime_mode: 'idle'}, error: foreground ? null : '微信唤醒失败'};
+        const wakeResult = ensureWechatForegroundForWake();
+        return {success: wakeResult.success,
+            result: {runtime_mode: 'idle', foreground_verification: wakeResult},
+            error: wakeResult.success ? null : '微信前台确认超时'};
     }
     return {success: false, error: '不支持的动作类型: ' + task.action_type};
 }
