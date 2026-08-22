@@ -1,9 +1,9 @@
 {
 "download_url": "https://mgx001.oss-cn-beijing.aliyuncs.com/release.iec",
-"version":175,
+"version":177,
 "dialog":false,
-"msg": "优化日程时段与连续聊天扫码抢占",
+"msg": "修复视频号入口验证与重试",
 "force": true,
-"md5":"2296379dd7caae6c94da807041fd98aa",
+"md5":"79cd6e2870d5cd19b6804e3917062f35",
 "download_timeout":300
 }
